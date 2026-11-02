@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Internal listener: /healthz /readyz /metrics are auth-exempt by design
+  # (Docker-network only; Caddy only exposes the public listener).
+  - job_name: ingester
+    static_configs:
+      - targets: ["ingester:9000"]
+  - job_name: worker
+    static_configs:
+      - targets: ["worker:9100"]

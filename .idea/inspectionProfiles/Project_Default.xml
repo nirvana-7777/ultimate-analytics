@@ -1,0 +1,27 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="fastapi" />
+          <option value="uvicorn" />
+          <option value="pydantic" />
+          <option value="python-multipart" />
+          <option value="cryptography" />
+          <option value="aiohttp" />
+          <option value="httpx" />
+          <option value="aiohttp-socks" />
+          <option value="python-dotenv" />
+          <option value="psutil" />
+          <option value="python-dateutil" />
+          <option value="numpy" />
+          <option value="redis" />
+          <option value="pytest" />
+          <option value="pytest-asyncio" />
+          <option value="pytest-cov" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

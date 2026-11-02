@@ -1,0 +1,99 @@
+services:
+  caddy:
+    build: ./caddy
+    ports: ["443:443", "80:80"]
+    volumes:
+      - "./caddy/Caddyfile:/etc/caddy/Caddyfile:ro"
+      - "caddy_data:/data"
+    depends_on:
+      ingester: { condition: service_healthy }
+    restart: unless-stopped
+
+  # One-shot migrator: ingester and worker gate on service_completed_successfully.
+  # Both also call migrate() at boot under an advisory lock (idempotent, defensive).
+  migrator:
+    build: { context: ., dockerfile: ingester/Dockerfile }
+    command: ["python", "-m", "app.db", "migrate"]
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  ingester:
+    build: { context: ., dockerfile: ingester/Dockerfile }
+    command: ["python", "-m", "app.main"]
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrator: { condition: service_completed_successfully }
+    healthcheck:
+      # python:3.12-sim has no curl; healthz is on the internal listener (9000).
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:9000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: { context: ., dockerfile: ingester/Dockerfile }
+    command: ["python", "-m", "worker.main"]
+    env_file: .env
+    environment:
+      ANALYTICS_AUTH_TOKEN: ""            # worker never serves /ingest
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrator: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: analytics
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    secrets: [pg_password]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics -d analytics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11
+    # Not published publicly: reached via grafana.example.com (Caddy) or the
+    # 127.0.0.1 binding below (SSH tunnel fallback).
+    ports: ["127.0.0.1:3000:3000"]
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      # Export the pg password (shared secret) so provisioning ${ANALYTICS_PG_PASSWORD} resolves.
+      - 'export ANALYTICS_PG_PASSWORD="$(cat /run/secrets/pg_password)"; exec /run.sh'
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    secrets: [grafana_admin, pg_password]
+    volumes:
+      - "./grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "grafana_data:/var/lib/grafana"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - "./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro"
+    restart: unless-stopped
+
+volumes:
+  pgdata: {}
+  grafana_data: {}
+  caddy_data: {}
+
+secrets:
+  pg_password:   { file: ./secrets/pg_password }
+  grafana_admin: { file: ./secrets/grafana_admin }

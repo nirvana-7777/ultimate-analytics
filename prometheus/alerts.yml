@@ -1,0 +1,47 @@
+groups:
+  - name: analytics
+    rules:
+      # Ingest gap (doc §7): the only outage signal — the backend sends no
+      # drop counters. Fires when a sender that was active in the last hour
+      # has produced nothing for >10 min.
+      - alert: AnalyticsIngestGap
+        expr: >
+          (time() - analytics_last_event_ts > 600)
+          and on(sender) (increase(analytics_events_received_total[1h]) > 0)
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "No events from sender={{ $labels.sender }} for >10m after traffic in the last hour"
+
+      # A backend regression or schema mismatch shows up here first.
+      - alert: AnalyticsQuarantineSpike
+        expr: sum by (reason) (increase(analytics_events_quarantined_total[10m])) > 20
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Quarantine spike: reason={{ $labels.reason }}"
+
+      # Steady clock skew (round-2 C): the histogram catches what
+      # analytics_events_late_total (regression detector) cannot.
+      - alert: AnalyticsIngestSkew
+        expr: >
+          histogram_quantile(0.99,
+            sum by (sender, le) (rate(analytics_ingest_lag_seconds_bucket[10m]))) > 600
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "sender={{ $labels.sender }}: p99 ingest lag >10min — check backend clocks"
+
+      - alert: AnalyticsWorkerStuck
+        expr: analytics_worker_lag_seconds > 300
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Worker has not completed a tick for >5min"
+
+      - alert: AnalyticsRollupDroppedLate
+        expr: increase(analytics_rollup_dropped_late_total[10m]) > 0
+        for: 0m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Rollup dropped late/over-cap buckets — check skew vs ANALYTICS_MAX_EVENTS_AGE_S"

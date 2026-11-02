@@ -1,0 +1,575 @@
+{
+ "annotations": {
+  "list": []
+ },
+ "editable": true,
+ "graphTooltip": 1,
+ "refresh": "1m",
+ "schemaVersion": 39,
+ "tags": [
+  "analytics",
+  "provisioned"
+ ],
+ "time": {
+  "from": "now-3h",
+  "to": "now"
+ },
+ "timezone": "browser",
+ "title": "Streaming Analytics",
+ "uid": "streaming-analytics",
+ "version": 1,
+ "panels": [
+  {
+   "id": 1,
+   "title": "Current watched channels",
+   "description": "Active in last ~3 min, from the sessions table (fresh, no rollup lag). Split by delivery \u2014 redirect rows are session starts, proxied rows are ongoing sessions.",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {},
+   "targets": [
+    {
+     "refId": "A",
+     "format": "table",
+     "rawSql": "SELECT delivery, provider, content_type, channel_id, count(*) AS active\nFROM sessions\nWHERE closed = false OR ended_at > $__unixEpochTo() - 180\nGROUP BY 1,2,3,4\nORDER BY 5 DESC\nLIMIT 20",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "title": "Views by delivery",
+   "description": "Redirect = manifest-request events (excluding http_status >= 400); proxied = sessions started. Never blended into a single number.",
+   "type": "timeseries",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 0
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "rawSql": "SELECT bucket AS \"time\", delivery, sum(views) AS views\nFROM rollup_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1,2\nORDER BY 1",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "title": "Viewer-seconds (proxied-derived)",
+   "description": "Redirect sessions contribute 0 \u2014 no heartbeat (doc \u00a74). Attributed at session start: long sessions spike their start bucket; the companion rate panel below corrects that.",
+   "type": "timeseries",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 8
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "rawSql": "SELECT date_trunc('minute', to_timestamp(started_at)) AS \"time\",\n       sum(duration_s) AS viewer_seconds\nFROM sessions\nWHERE delivery = 'proxied' AND $__unixEpochFilter(started_at)\nGROUP BY 1\nORDER BY 1",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "title": "Concurrent proxied viewers (approx)",
+   "description": "sum(duration_s)/60 per start-minute \u2014 the derived rate metric a 2h session should produce, instead of a start-bucket spike.",
+   "type": "timeseries",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 8
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "rawSql": "SELECT date_trunc('minute', to_timestamp(started_at)) AS \"time\",\n       sum(duration_s) / 60.0 AS concurrent_approx\nFROM sessions\nWHERE delivery = 'proxied' AND $__unixEpochFilter(started_at)\nGROUP BY 1\nORDER BY 1",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "title": "Top channels",
+   "description": "Split by delivery; delivery='error' rows excluded from most-watched.",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 16
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {},
+   "targets": [
+    {
+     "refId": "A",
+     "format": "table",
+     "rawSql": "SELECT delivery, provider, channel_id, sum(views) AS views\nFROM rollup_1m\nWHERE $__timeFilter(bucket) AND delivery <> 'error'\nGROUP BY 1,2,3\nORDER BY 4 DESC\nLIMIT 20",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "title": "Top providers",
+   "description": "Split by delivery.",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 16
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {},
+   "targets": [
+    {
+     "refId": "A",
+     "format": "table",
+     "rawSql": "SELECT delivery, provider, sum(views) AS views\nFROM rollup_1m\nWHERE $__timeFilter(bucket) AND delivery <> 'error'\nGROUP BY 1,2\nORDER BY 3 DESC\nLIMIT 20",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "title": "Client-declared country",
+   "description": "Query param from the client, NOT geolocation (doc \u00a73). Split by delivery.",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 24
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {},
+   "targets": [
+    {
+     "refId": "A",
+     "format": "table",
+     "rawSql": "SELECT delivery, country, sum(views) AS views\nFROM rollup_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1,2\nORDER BY 3 DESC\nLIMIT 20",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "title": "Sessions started by delivery",
+   "description": "All sessions (any dominant delivery) started per minute.",
+   "type": "timeseries",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 24
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "rawSql": "SELECT bucket AS \"time\", delivery, sum(sessions) AS sessions\nFROM rollup_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1,2\nORDER BY 1",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "title": "Errors",
+   "description": "Events with http_status >= 400 (doc \u00a76).",
+   "type": "timeseries",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 32
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "rawSql": "SELECT bucket AS \"time\", sum(errors) AS errors\nFROM rollup_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "title": "Delivery mix",
+   "description": "How much traffic is redirect vs proxied vs error \u2014 explains duration coverage. '' rows are events with unknown delivery (future senders).",
+   "type": "piechart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 32
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {},
+   "targets": [
+    {
+     "refId": "A",
+     "format": "table",
+     "rawSql": "SELECT delivery, sum(events) AS events\nFROM rollup_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 2 DESC",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "title": "Error detail (raw events)",
+   "description": "Hits the raw events table \u2014 bounded by raw retention.",
+   "type": "table",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 40
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {},
+   "targets": [
+    {
+     "refId": "A",
+     "format": "table",
+     "rawSql": "SELECT to_timestamp(ts) AS time, provider, channel_id, http_status, delivery, country\nFROM events\nWHERE http_status >= 400 AND $__unixEpochFilter(ts)\nORDER BY ts DESC\nLIMIT 100",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     }
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "title": "Events received /s by sender",
+   "description": "Ingest health. Per-sender requires the backend UA marker (round-1 note).",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 48
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (sender) (rate(analytics_events_received_total[5m]))",
+     "legendFormat": "{{sender}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "title": "Seconds since last event",
+   "description": "Receive-time based. Alert fires at >600s (see prometheus/alerts.yml).",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 48
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "time() - analytics_last_event_ts",
+     "legendFormat": "{{sender}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "title": "Ingest lag p99 (received_at - ts)",
+   "description": "Steady-skew alarm; drives REBUILD_WINDOW sizing.",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 56
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.99, sum by (sender, le) (rate(analytics_ingest_lag_seconds_bucket[10m])))",
+     "legendFormat": "{{sender}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "title": "Quarantined events /s by reason",
+   "description": "A schema mismatch or backend regression shows up here first.",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 56
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (reason) (rate(analytics_events_quarantined_total[10m]))",
+     "legendFormat": "{{reason}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     }
+    }
+   ]
+  }
+ ]
+}
