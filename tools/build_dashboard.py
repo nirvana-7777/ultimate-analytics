@@ -21,6 +21,7 @@ PG_OPTIONS = {"legend": {"displayMode": "list", "placement": "bottom"},
 def build() -> dict:
     panels = []
     for p in PANELS:
+        defaults = {k: p[k] for k in ("unit", "decimals") if k in p}
         panel = {
             "id": p["id"],
             "title": p["title"],
@@ -28,8 +29,9 @@ def build() -> dict:
             "type": p["type"],
             "datasource": DS_PG if p["ds"] == "postgres" else DS_PROM,
             "gridPos": p["gridPos"],
-            "fieldConfig": {"defaults": {}, "overrides": []},
-            "options": PG_OPTIONS if p["type"] == "timeseries" else {},
+            "fieldConfig": {"defaults": defaults, "overrides": []},
+            "options": p.get("options",
+                             PG_OPTIONS if p["type"] == "timeseries" else {}),
             "targets": [],
         }
         if p["ds"] == "postgres":
@@ -38,6 +40,8 @@ def build() -> dict:
                 "format": p["format"],
                 "rawSql": p["sql"],
                 "datasource": DS_PG,
+                "rawQuery": True,
+                "editorMode": "code",
             })
         else:
             panel["targets"].append({
@@ -45,7 +49,11 @@ def build() -> dict:
                 "expr": p["expr"],
                 "legendFormat": p.get("legend", ""),
                 "datasource": DS_PROM,
+                "editorMode": "code",
+                "range": True,
             })
+        if "interval" in p:  # min step; keeps $__interval >= the 1m rollup bucket
+            panel["interval"] = p["interval"]
         panels.append(panel)
 
     return {
