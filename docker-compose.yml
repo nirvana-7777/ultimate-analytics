@@ -1,13 +1,18 @@
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
 services:
   caddy:
     build: ./caddy
-    ports: ["443:443", "80:80"]
+    ports: ["443:443", "443:443/udp", "80:80"]   # udp: HTTP/3
     volumes:
       - "./caddy/Caddyfile:/etc/caddy/Caddyfile:ro"
       - "caddy_data:/data"
     depends_on:
       ingester: { condition: service_healthy }
     restart: unless-stopped
+    logging: *default-logging
 
   # One-shot migrator: ingester and worker gate on service_completed_successfully.
   # Both also call migrate() at boot under an advisory lock (idempotent, defensive).
@@ -18,6 +23,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
     restart: "no"
+    logging: *default-logging
 
   ingester:
     build: { context: ., dockerfile: ingester/Dockerfile }
@@ -34,6 +40,7 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+    logging: *default-logging
 
   worker:
     build: { context: ., dockerfile: ingester/Dockerfile }
@@ -54,6 +61,7 @@ services:
       postgres: { condition: service_healthy }
       migrator: { condition: service_completed_successfully }
     restart: unless-stopped
+    logging: *default-logging
 
   postgres:
     image: postgres:16
@@ -75,6 +83,23 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+    logging: *default-logging
+
+  # One-shot, idempotent: (re)creates the read-only Grafana role once migrations
+  # have created the tables. Safe on every `docker compose up`.
+  # ($$ escapes compose interpolation; the shell sees $(...).)
+  grafana-role:
+    image: postgres:16
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'PGPASSWORD="$$(cat /run/secrets/pg_password)" exec psql -h postgres -U analytics -d analytics -v ON_ERROR_STOP=1 -v grafana_pw="$$(cat /run/secrets/grafana_pg_password)" -f /sql/grafana_ro.sql'
+    secrets: [pg_password, grafana_pg_password]
+    volumes: ["./postgres/grafana_ro.sql:/sql/grafana_ro.sql:ro"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrator: { condition: service_completed_successfully }
+    restart: "no"
+    logging: *default-logging
 
   grafana:
     image: grafana/grafana-oss:11
@@ -84,31 +109,47 @@ services:
     entrypoint:
       - "/bin/sh"
       - "-c"
-      # Export the pg password (shared secret) so provisioning ${ANALYTICS_PG_PASSWORD} resolves.
-      - 'export ANALYTICS_PG_PASSWORD="$(cat /run/secrets/pg_password)"; exec /run.sh'
+      # Export the read-only role's password so provisioning ${GRAFANA_PG_PASSWORD} resolves.
+      # Grafana no longer sees the app/superuser password.
+      - 'export GRAFANA_PG_PASSWORD="$$(cat /run/secrets/grafana_pg_password)"; exec /run.sh'
     environment:
       GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin
       GF_USERS_ALLOW_SIGN_UP: "false"
-    secrets: [grafana_admin, pg_password]
+    secrets: [grafana_admin, grafana_pg_password]
     volumes:
       - "./grafana/provisioning:/etc/grafana/provisioning:ro"
       - "grafana_data:/var/lib/grafana"
     depends_on:
       postgres: { condition: service_healthy }
+      grafana-role: { condition: service_completed_successfully }
     restart: unless-stopped
+    logging: *default-logging
 
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v3.5.0   # pinned (was :latest); bump deliberately
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
     volumes:
       - "./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
       - "./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro"
+      - "prometheus_data:/prometheus"   # metrics survive container recreation
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   pgdata: {}
   grafana_data: {}
   caddy_data: {}
+  prometheus_data: {}
 
 secrets:
   pg_password:   { file: ./secrets/pg_password }
   grafana_admin: { file: ./secrets/grafana_admin }
+  grafana_pg_password: { file: ./secrets/grafana_pg_password }
