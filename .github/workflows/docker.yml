@@ -1,0 +1,200 @@
+# Save as .github/workflows/docker.yml
+name: CI and Docker Publish
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same PR supersedes the older run; branch/tag runs always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: analytics
+          POSTGRES_PASSWORD: analytics
+          POSTGRES_DB: analytics
+          # compose pins timezone=UTC (partition bounds depend on it); keep CI identical.
+          TZ: UTC
+          PGTZ: UTC
+        ports: [ "5432:5432" ]
+        options: >-
+          --health-cmd "pg_isready -U analytics -d analytics"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # TODO: use the variable name(s) that app.db and tests/panels/test_panel_sql.py read.
+      ANALYTICS_DATABASE_URL: postgresql://analytics:analytics@localhost:5432/analytics
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'          # matches the python:3.12 base image
+          cache: 'pip'
+          cache-dependency-path: '**/requirements*.txt'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Dashboard JSON is in sync with tools/panels.py
+        run: |
+          python tools/build_dashboard.py
+          git diff --exit-code -- grafana/provisioning/dashboards/analytics.json
+
+      # Remove this step if the tests create the schema themselves.
+      - name: Migrate database
+        run: python -m app.db migrate
+
+      - name: Run tests (incl. panel SQL against real Postgres)
+        run: pytest -q
+
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Validate Prometheus config and alert rules
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.5.0 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.5.0 check rules /etc/prometheus/alerts.yml
+
+      - name: Validate docker-compose.yml
+        run: |
+          mkdir -p secrets
+          for s in pg_password grafana_admin grafana_pg_password; do
+            [ -e "secrets/$s" ] || echo ci > "secrets/$s"
+          done
+          touch .env
+          docker compose config --quiet
+
+  caddy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The rate_limit directive comes from a plugin, so validate against the
+      # image built from ./caddy, not the stock caddy image.
+      - name: Build Caddy image (amd64, kept local)
+        uses: docker/build-push-action@v7
+        with:
+          context: ./caddy
+          load: true
+          push: false
+          tags: analytics-caddy:ci
+          cache-from: type=gha,scope=caddy
+
+      - name: Validate Caddyfile
+        run: |
+          docker run --rm \
+            -v "$PWD/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            analytics-caddy:ci \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+  docker:
+    needs: [test, config, caddy]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One image serves ingester, worker and migrator (same Dockerfile, different command).
+          - name: ingester
+            image: nirvana777/analytics-ingester
+            context: .
+            file: ingester/Dockerfile
+          - name: caddy
+            image: nirvana777/analytics-caddy
+            context: ./caddy
+            file: caddy/Dockerfile
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # arm64 RUN steps need emulation; PRs only build amd64, so skip it there.
+      - name: Set up QEMU
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # On PRs this still builds (catches a broken Dockerfile) but never pushes.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [test, config, caddy, docker]
+    if: always()
+    steps:
+      - name: Workflow status
+        run: |
+          echo "Test job:   ${{ needs.test.result }}"
+          echo "Config job: ${{ needs.config.result }}"
+          echo "Caddy job:  ${{ needs.caddy.result }}"
+          echo "Docker job: ${{ needs.docker.result }}"
+
+      # Single job to mark as "required" in branch protection.
+      - name: Fail if any job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
