@@ -1,13 +1,25 @@
 """Nightly empirical inter-event gap distribution per content_type — the data
-behind SESSION_GAP_S retuning (not intuition). Writes to gap_histogram."""
-import time
+behind SESSION_GAP_S retuning (not intuition). Writes to gap_histogram.
 
-LAST = {"t": 0.0}
+Round-3 review (blocker 2): the last-run marker was a module global, so the
+day-scan re-ran on EVERY worker restart — inside the tick transaction, on the
+ingester's 1.5 s statement_timeout, rolling back sessionize+rollup with it at
+volume. The worker now calls update() from its own isolated phase and tracks
+the cadence in worker_state, so a restart resumes instead of re-bursting.
+
+NaN gaps (from any pre-scrub poison rows) would flow straight into
+percentile_disc and store NaN quietly; `gap < 1e9` excludes them — PostgreSQL
+orders NaN as greater than everything, so NaN fails the comparison. (1e9 s
+≈ 31 years, far beyond any plausible inter-event gap.)
+"""
+import logging
+
+log = logging.getLogger("worker.gap_histogram")
+
+INTERVAL_S = 86400.0  # once per day, persisted in worker_state
 
 
-def maybe_update(cur, cfg) -> None:
-    if time.time() - LAST["t"] < 86400:
-        return
+def update(cur, cfg) -> None:
     cur.execute("""
         WITH gaps AS (
           SELECT COALESCE(content_type, '') AS ct, ts - lag(ts) OVER (
@@ -23,7 +35,7 @@ def maybe_update(cur, cfg) -> None:
                percentile_disc(0.99) WITHIN GROUP (ORDER BY gap),
                count(*)
         FROM gaps
-        WHERE gap IS NOT NULL
+        WHERE gap IS NOT NULL AND gap < 1e9
         GROUP BY ct
         ON CONFLICT (day, content_type) DO UPDATE SET
           p50_s = EXCLUDED.p50_s, p90_s = EXCLUDED.p90_s,
@@ -33,5 +45,4 @@ def maybe_update(cur, cfg) -> None:
         "SELECT content_type, p50_s, p90_s, p99_s, samples FROM gap_histogram "
         "WHERE day = current_date ORDER BY content_type")
     for r in cur.fetchall():
-        print("gap_histogram", r, flush=True)
-    LAST["t"] = time.time()
+        log.info("gap_histogram %s", r)

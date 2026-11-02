@@ -55,6 +55,12 @@ def _fetch_event(where="ORDER BY id DESC LIMIT 1"):
         return cur.fetchone()
 
 
+def _fetch_ua(where="ORDER BY id DESC LIMIT 1"):
+    with conn_factory() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT user_agent, raw FROM events {where}")
+        return cur.fetchone()
+
+
 def _quarantine_count(reason=None):
     with conn_factory() as conn, conn.cursor() as cur:
         if reason:
@@ -67,7 +73,7 @@ def _quarantine_count(reason=None):
 @pytest.fixture(autouse=True)
 def _clean():
     with conn_factory() as conn, conn.cursor() as cur:
-        cur.execute("TRUNCATE events, quarantine")
+        cur.execute("TRUNCATE events, quarantine, worker_state")
     yield
 
 
@@ -174,3 +180,121 @@ def test_body_cap_413():
 
 def test_empty_batch_202():
     assert _post({"events": []}).status_code == 202
+
+
+# ---------------------------------------------------------------- round-3 --
+# Poison inputs: the review's blockers 1/3/5, asserted end-to-end against the
+# real app + real Postgres. Every one of these used to be either a 503 (=
+# the backend drops the whole batch, at-most-once) or a worker wedge.
+
+
+def test_nan_ts_quarantined_batch_survives():
+    """json.loads accepts NaN; `nan <= 0` is False; the old check waved it
+    through and int(nan // 60) later wedged the worker tick forever."""
+    ev_ok = _event(client_ip="203.0.113.41")
+    ev_nan = _event(client_ip="203.0.113.42")
+    ev_nan["ts"] = float("nan")   # httpx/json serializes as `NaN` literal
+    ev_inf = _event(client_ip="203.0.113.43")
+    ev_inf["ts"] = float("-Infinity")
+    r = _post({"events": [ev_nan, ev_ok, ev_inf]})
+    assert r.status_code == 202
+    assert _quarantine_count("invalid_ts") == 2
+    assert _fetch_event("WHERE client_ip = '203.0.113.41'") is not None
+    assert _fetch_event("WHERE client_ip = '203.0.113.42'") is None
+
+
+def test_huge_and_future_ts_quarantined():
+    now = time.time()
+    ev = _event(client_ip="203.0.113.44")
+    ev["ts"] = 1e308                     # to_timestamp(1e308) errors in PG
+    ev2 = _event(client_ip="203.0.113.45")
+    ev2["ts"] = now + 3 * 86400          # > 1 day ahead = poison, not skew
+    assert _post({"events": [ev, ev2]}).status_code == 202
+    assert _quarantine_count("ts_in_future") == 2
+    assert _fetch_event() is None
+
+
+def test_nul_bytes_sanitized_not_dropped():
+    """NUL is rejected by PG text and by jsonb (\\u0000 escape): the old code
+    503'd the WHOLE batch. user_agent is client-controlled => reachable."""
+    ev = _event(user_agent="bad\x00agent/1", client_ip="203.0.113.46")
+    ev["weird_field"] = "key\x00value"
+    r = _post({"events": [ev, _event(client_ip="203.0.113.47")]})
+    assert r.status_code == 202
+    assert _quarantine_count() == 0
+    ua, raw = _fetch_ua("WHERE client_ip = '203.0.113.46'")
+    assert "\x00" not in ua and "\ufffd" in ua
+    assert "\ufffd" in raw["weird_field"] and "\x00" not in raw["weird_field"]
+    assert _fetch_event("WHERE client_ip = '203.0.113.47'") is not None
+
+
+def test_lone_surrogate_sanitized_not_dropped():
+    # A lone UTF-16 surrogate cannot be UTF-8 encoded; psycopg raised at
+    # executemany time -> 503 -> dropped batch.
+    ev = _event(user_agent="sur\ud800rogate", client_ip="203.0.113.48")
+    assert _post({"events": [ev]}).status_code == 202
+    assert _quarantine_count() == 0
+    ua = _fetch_ua("WHERE client_ip = '203.0.113.48'")[0]
+    assert "\ufffd" in ua
+
+
+def test_nan_in_raw_json_stringified():
+    # jsonb rejects the NaN token; the raw copy keeps it as a string.
+    ev = _event(client_ip="203.0.113.49")
+    ev["custom_metric"] = float("nan")
+    assert _post({"events": [ev]}).status_code == 202
+    raw = _fetch_event("WHERE client_ip = '203.0.113.49'")[10]
+    assert raw["custom_metric"] == "NaN"
+
+
+def test_event_type_length_capped_for_label_cardinality():
+    # event_type is a Prometheus label: unbounded length/value = unbounded
+    # cardinality and memory (review blocker 5).
+    ev = _event(event_type="t" * 65, client_ip="203.0.113.50")
+    ev_ok = _event(event_type="t" * 64, client_ip="203.0.113.51")
+    assert _post({"events": [ev, ev_ok]}).status_code == 202
+    assert _quarantine_count("event_type_too_long") == 1
+    assert _fetch_event("WHERE client_ip = '203.0.113.51'")[1] == "t" * 64
+
+
+def test_events_per_batch_cap_413():
+    # 1 MB of `{}` is ~350k events -> as many quarantine rows; the cap is a
+    # request-level contract violation (413), not silent trimming.
+    n = 5001
+    events = [{"schema_version": 1, "ts": time.time(), "event_type": "x"}
+              for _ in range(n)]
+    r = _post({"events": events})
+    assert r.status_code == 413
+    assert "5000" in r.json()["detail"]
+
+
+def test_docs_not_exposed():
+    # public listener must not serve /docs /redoc /openapi.json
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        resp = client.get(path, follow_redirects=False)
+        assert resp.status_code == 404, path
+
+
+def test_insert_fallback_quarantines_only_the_bad_event(monkeypatch):
+    """The savepoint machinery: a poison that validation somehow missed
+    (simulated here by injecting a DB-constraint violation after validation)
+    must quarantine ONE event, not 503 the batch."""
+    import app.main as m
+    real_validate = m.validate_event
+
+    def let_one_poison_through(e):
+        row, reason = real_validate(e)
+        if row is not None and e.get("user_agent") == "poison-me":
+            row["http_status"] = 999  # violates the DB CHECK, not validation
+        return row, reason
+
+    monkeypatch.setattr(m, "validate_event", let_one_poison_through)
+    r = _post({"events": [
+        _event(user_agent="poison-me", client_ip="203.0.113.52"),
+        _event(user_agent="fine", client_ip="203.0.113.53"),
+    ]})
+    monkeypatch.undo()
+    assert r.status_code == 202
+    assert _quarantine_count("insert_failed") == 1
+    assert _fetch_event("WHERE client_ip = '203.0.113.52'") is None
+    assert _fetch_event("WHERE client_ip = '203.0.113.53'") is not None

@@ -1,19 +1,26 @@
 # For local testing without DNS: change the site addresses to `localhost`
 # (Caddy will use its internal CA) or add hosts entries pointing here.
 analytics.example.com {
-	# Backstop only. A 429 is a dropped batch on the backend (doc §2,
-	# at-most-once, no retry). Tightening this = choosing to lose data.
-	# Tune alongside ANALYTICS_SESSION_GAP_S.
-	rate_limit {
-		zone ingest {
-			key {remote_host}
-			events 120
-			window 1m
-		}
-	}
-	reverse_proxy ingester:8000
+        # Enforced at the EDGE, before any buffering: the app checks
+        # Content-Length, but chunked requests have none and Starlette's
+        # request.body() buffers the whole body before we can measure it
+        # (review blocker 5). 1MiB matches the app's MAX_BODY.
+        request_body {
+                max_size 1MiB
+        }
+        # Backstop only. A 429 is a dropped batch on the backend (doc §2,
+        # at-most-once, no retry). Tightening this = choosing to lose data.
+        # Tune alongside ANALYTICS_SESSION_GAP_S.
+        rate_limit {
+                zone ingest {
+                        key {remote_host}
+                        events 120
+                        window 1m
+                }
+        }
+        reverse_proxy ingester:8000
 }
 
 grafana.example.com {
-	reverse_proxy grafana:3000
+        reverse_proxy grafana:3000
 }

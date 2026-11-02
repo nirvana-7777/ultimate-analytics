@@ -41,6 +41,15 @@ services:
     env_file: .env
     environment:
       ANALYTICS_AUTH_TOKEN: ""            # worker never serves /ingest
+    healthcheck:
+      # :9100/metrics proves the process + metrics thread are alive; tick
+      # PROGRESS is what the analytics_worker_lag_seconds alert is for.
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:9100/metrics')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       postgres: { condition: service_healthy }
       migrator: { condition: service_completed_successfully }
@@ -48,7 +57,13 @@ services:
 
   postgres:
     image: postgres:16
+    # TimeZone is PINNED: partition bounds are date literals evaluated with
+    # the session TimeZone, and prune() compares partition names built from
+    # now(). A host with TZ=Europe/Berlin would silently create partitions
+    # shifted by hours (review blocker 4).
+    command: ["postgres", "-c", "timezone=UTC"]
     environment:
+      TZ: UTC
       POSTGRES_DB: analytics
       POSTGRES_USER: analytics
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password

@@ -78,3 +78,23 @@ def test_country_and_provider_from_first_event(conn, cfg):
     rebuild(conn, cfg, now - 3600)
     provider, country = one(conn, "SELECT provider, country FROM sessions")
     assert (provider, country) == ("edge-a", "DE")
+
+
+def test_two_views_behind_nat_do_not_fragment(conn, cfg):
+    """Round-3 review: 'Two TVs alternating channels [behind one NAT]
+    fragment into one-event sessions.' The per-key grouping keeps each
+    channel's stream continuous: events of the same key are compared only
+    against each other, not against the interleaved other key."""
+    now = time.time()
+    with conn.cursor() as cur:
+        # two viewers behind one IP, alternating heartbeats every 30 s
+        for i in range(10):
+            insert_event(cur, now - 300 + i * 30, channel="ch1", ip="198.51.100.30")
+            insert_event(cur, now - 285 + i * 30, channel="ch2", ip="198.51.100.30")
+    rebuild(conn, cfg, now - 3600)
+    count, events, min_dur = one(conn, """
+        SELECT count(*), sum(event_count), min(duration_s) FROM sessions
+        WHERE client_ip = '198.51.100.30'""")
+    assert count == 2, "one continuous session per channel, not 20 fragments"
+    assert events == 20
+    assert min_dur >= 250, "each session spans the whole 5-minute window"

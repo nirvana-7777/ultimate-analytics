@@ -18,10 +18,13 @@ def _bucket(ts):
 
 def test_skewed_events_land_in_their_ts_buckets(conn, cfg):
     now = time.time()
+    # pin the 5 events inside one bucket (a straddling minute boundary makes
+    # the per-bucket count assertion flaky)
+    skewed = _bucket(now - 1200) + 5
     with conn.cursor() as cur:
         # 5 redirect events with ts 20 min ago, received just now.
         for i in range(5):
-            insert_event(cur, now - 1200 + i, ip="198.51.100.9", delivery="redirect",
+            insert_event(cur, skewed + i, ip="198.51.100.9", delivery="redirect",
                          status=200)
 
     rewritten, deleted = rebuild(conn, cfg, now - 3600)
@@ -30,7 +33,7 @@ def test_skewed_events_land_in_their_ts_buckets(conn, cfg):
     row = one(conn, """
         SELECT events, views, sessions, errors FROM rollup_1m
         WHERE bucket = to_timestamp(%s) AND delivery = 'redirect'
-    """, (_bucket(now - 1200),))
+    """, (_bucket(skewed),))
     assert row is not None, "skewed traffic must appear in its ts bucket"
     events, views, sessions, errors = row
     assert events == 5
@@ -72,9 +75,10 @@ def test_too_old_ts_dropped_and_counted(conn, cfg):
 
 def test_rollup_is_idempotent(conn, cfg):
     now = time.time()
+    skewed = _bucket(now - 1200) + 5
     with conn.cursor() as cur:
         for i in range(3):
-            insert_event(cur, now - 1200 + i, ip="198.51.100.13", delivery="redirect")
+            insert_event(cur, skewed + i, ip="198.51.100.13", delivery="redirect")
 
     rewritten, deleted = rebuild(conn, cfg, now - 3600)
     for _ in range(3):  # re-roll the same window repeatedly

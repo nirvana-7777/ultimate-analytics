@@ -45,3 +45,22 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "Rollup dropped late/over-cap buckets — check skew vs ANALYTICS_MAX_EVENTS_AGE_S"
+
+      # Round-3: rows in the DEFAULT partition mean partition maintenance
+      # failed (worker down / ensure_ahead erroring) — ingest still works,
+      # but the worker must be fixed before the safety net fills up.
+      - alert: AnalyticsRowsInDefaultPartition
+        expr: analytics_events_in_default > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "events_default holds {{ $value }} rows — worker partition maintenance is behind"
+
+      # Round-3: the per-event fallback should be ~0 after the sanitizer; any
+      # sustained rate means an unknown poison class is reaching the DB.
+      - alert: AnalyticsIngestBatchFallback
+        expr: increase(analytics_ingest_batch_fallback_total[10m]) > 2
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Per-event insert fallback fired — an unknown poison is passing validation"

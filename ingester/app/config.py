@@ -24,6 +24,10 @@ class Config:
     public_port: int
     internal_port: int
     log_level: str
+    # Round-3 review: request/batch bounds and worker pool budgets.
+    max_events_per_batch: int
+    worker_statement_timeout_ms: int
+    ddl_lock_timeout_ms: int
 
 
 def load() -> Config:
@@ -43,4 +47,13 @@ def load() -> Config:
         public_port=int(os.environ.get("ANALYTICS_PUBLIC_PORT", "8000")),
         internal_port=int(os.environ.get("ANALYTICS_INTERNAL_PORT", "9000")),
         log_level=os.environ.get("ANALYTICS_LOG_LEVEL", "info"),
+        # 1 MB of `{}` is ~350k events -> as many quarantine rows (blocker 5).
+        max_events_per_batch=int(os.environ.get("ANALYTICS_MAX_EVENTS_PER_BATCH", "5000")),
+        # Worker runs day-scans (gap histogram) that must never wear the
+        # ingester's 1.5 s statement_timeout (blocker 2).
+        worker_statement_timeout_ms=int(os.environ.get(
+            "ANALYTICS_WORKER_STATEMENT_TIMEOUT_MS", "60000")),
+        # Partition DDL must never queue behind (or hold up) ingest inserts;
+        # bail out fast instead and retry next tick (blocker 4).
+        ddl_lock_timeout_ms=int(os.environ.get("ANALYTICS_DDL_LOCK_TIMEOUT_MS", "3000")),
     )

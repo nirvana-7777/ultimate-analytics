@@ -1,7 +1,11 @@
+# Runtime dependencies for the ingester/worker image (loose spec).
+# The Docker build installs from requirements.lock.txt (pip-compile output,
+# exact versions + hashes); regenerate with:
+#   pip-compile --generate-hashes --output-file=requirements.lock.txt requirements.txt
+# NOTE: pydantic is intentionally absent — it was listed but never imported;
+# FastAPI pulls the version it needs transitively. pytest/httpx live in
+# requirements-dev.txt and must never ship in the prod image.
 fastapi==0.115.*
 uvicorn[standard]==0.32.*
 psycopg[binary,pool]==3.2.*
 prometheus-client==0.21.*
-pydantic==2.9.*
-pytest==8.3.*
-httpx==0.27.*

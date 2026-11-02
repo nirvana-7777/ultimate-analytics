@@ -16,8 +16,26 @@ views definition (design §5):
   proxied:  sessions started in the bucket (session.delivery='proxied')
   error:    0
 sessions = all sessions started in the bucket.
+
+Round-3 review hardening:
+  * bucket discovery is pushed down: SELECT DISTINCT floor(ts/60) in SQL,
+    instead of streaming every distinct ts float into Python.
+  * the range predicate `ts >= %s AND ts < %s` also filters poison rows
+    without touching them: PostgreSQL treats NaN as greater than everything,
+    so `NaN < max` is FALSE and NaN never reaches floor(); 1e308 likewise.
+    (ingest rejects them and migration 002 scrubs them — this is layer 3.)
+  * every bucket runs under its own SAVEPOINT: one poisoned bucket is
+    counted in analytics_rollup_bucket_errors_total and skipped, not allowed
+    to abort the whole core transaction (review blocker 1's wedge shape).
 """
+import logging
+import math
+
+import psycopg
+
 from app import metrics
+
+log = logging.getLogger("worker.rollup")
 
 INSERT_ROLLUP_SQL = """
     INSERT INTO rollup_1m
@@ -60,6 +78,10 @@ INSERT_ROLLUP_SQL = """
     ) sess USING (provider, channel_id, content_type, delivery, country)
 """
 
+# Absolute sanity bound for ts (epoch seconds; 1e12 ≈ year 33 654). Anything
+# above is poison by definition; also excludes NaN (NaN < 1e12 is FALSE).
+TS_HARD_MAX = 1e12
+
 
 def _bucket(ts: float) -> int:
     return int(ts // 60) * 60
@@ -68,24 +90,32 @@ def _bucket(ts: float) -> int:
 def recompute_touched(cur, cfg, rewritten, deleted_starts, last_run_start: float) -> None:
     now_epoch = float(cur.execute("SELECT extract(epoch FROM now())").fetchone()[0])
     min_ts = now_epoch - cfg.max_events_age_s
-
-    # Buckets touched by freshly-received events (received_at partition-prunes).
-    cur.execute(
-        "SELECT DISTINCT ts FROM events WHERE received_at >= to_timestamp(%s)",
-        (last_run_start - 5.0,),
-    )
-    buckets: set[int] = set()
     dropped = 0
-    for (ts,) in cur.fetchall():
-        ts = float(ts)
-        if ts < min_ts:
-            dropped += 1
-        else:
-            buckets.add(_bucket(ts))
+
+    # Buckets touched by freshly-received events (received_at partition-prunes
+    # + events_received_idx). Pushdown: DISTINCT in SQL, bounded by ts range —
+    # which also keeps NaN/1e308 out of floor() without raising.
+    cur.execute("""
+        SELECT DISTINCT floor(ts / 60) AS b
+        FROM events
+        WHERE received_at >= to_timestamp(%s)
+          AND ts >= %s AND ts < %s
+    """, (last_run_start - 5.0, min_ts, TS_HARD_MAX))
+    buckets: set[int] = {int(b) * 60 for (b,) in cur.fetchall()}
+
+    # Too-old events in the discovery window: dropped by the range predicate
+    # above, counted here for the ROLLUP_DROPPED_LATE alarm.
+    cur.execute("""
+        SELECT count(*) FROM events
+        WHERE received_at >= to_timestamp(%s) AND ts < %s
+    """, (last_run_start - 5.0, min_ts))
+    dropped += cur.fetchone()[0]
 
     # Buckets whose session set changed (inserts AND the starts deleted away).
     for s in list(rewritten) + list(deleted_starts):
-        if s < min_ts:
+        if not math.isfinite(s):
+            dropped += 1
+        elif s < min_ts:
             dropped += 1
         else:
             buckets.add(_bucket(s))
@@ -97,5 +127,15 @@ def recompute_touched(cur, cfg, rewritten, deleted_starts, last_run_start: float
         metrics.ROLLUP_DROPPED_LATE.inc(dropped)
 
     for b in sorted(buckets):
-        cur.execute("DELETE FROM rollup_1m WHERE bucket = to_timestamp(%s)", (b,))
-        cur.execute(INSERT_ROLLUP_SQL, (b, b, b + 60, b, b + 60))
+        # One bad bucket must not abort the core transaction (which holds the
+        # sessionize work too). conn.transaction() nests as a SAVEPOINT inside
+        # the worker's tick transaction and as BEGIN/COMMIT on an autocommit
+        # connection (tests) — one code path, both modes.
+        try:
+            with cur.connection.transaction():
+                cur.execute("DELETE FROM rollup_1m WHERE bucket = to_timestamp(%s)", (b,))
+                cur.execute(INSERT_ROLLUP_SQL, (b, b, b + 60, b, b + 60))
+        except psycopg.Error as e:
+            metrics.ROLLUP_BUCKET_ERRORS.inc()
+            log.warning("rollup bucket %s skipped after error: %s",
+                        b, str(e).splitlines()[0])

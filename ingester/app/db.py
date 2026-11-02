@@ -17,23 +17,43 @@ MIGRATIONS_DIR = Path(os.environ.get(
 MIGRATOR_LOCK_KEY = 0x5E55_AA01  # arbitrary but stable
 
 
-def make_pool(dsn: str) -> ConnectionPool:
-    # connect_timeout bounds connect (hung PG); statement_timeout bounds each
-    # statement so a wedged query cannot pin the (small) sync pool forever.
+def make_pool(
+    dsn: str,
+    *,
+    statement_timeout_ms: int = 1500,
+    idle_in_transaction_timeout_ms: int | None = None,
+    name: str = "analytics-pool",
+    max_size: int = 8,
+) -> ConnectionPool:
+    """connect_timeout bounds connect (hung PG); statement_timeout bounds each
+    statement so a wedged query cannot pin the (small) sync pool forever.
+
+    The worker passes its own budgets: it runs day-scans (gap histogram) and
+    multi-bucket rollups that must never wear the ingester's 1.5 s timeout
+    (review blocker 2 — previously every tick rolled back at volume, and with
+    a watermark that only advances on success, the window kept growing)."""
+    options = f"-c statement_timeout={statement_timeout_ms}"
+    if idle_in_transaction_timeout_ms:
+        options += f" -c idle_in_transaction_session_timeout={idle_in_transaction_timeout_ms}"
     return ConnectionPool(
         conninfo=dsn,
         min_size=1,
-        max_size=8,
+        max_size=max_size,
         timeout=2.0,
-        kwargs={"connect_timeout": 1, "options": "-c statement_timeout=1500"},
-        name="analytics-pool",
+        kwargs={"connect_timeout": 1, "options": options},
+        name=name,
         open=True,
     )
 
 
 def migrate(dsn: str) -> None:
     """Idempotent; safe under concurrent callers. Session-level advisory lock:
-    the second caller blocks, then sees the applied versions and no-ops."""
+    the second caller blocks, then sees the applied versions and no-ops.
+
+    The unlock is wrapped because a *connection-level* failure (PG restarted
+    mid-migration) would otherwise replace the real exception; the session
+    lock is released anyway when this connection closes.
+    """
     with psycopg.connect(dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(%s)", (MIGRATOR_LOCK_KEY,))
@@ -60,7 +80,11 @@ def migrate(dsn: str) -> None:
                                 (version,),
                             )
             finally:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (MIGRATOR_LOCK_KEY,))
+                try:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (MIGRATOR_LOCK_KEY,))
+                except Exception:
+                    # Unwritable connection: close() below releases the lock.
+                    pass
 
 
 def wait_for_pg(dsn: str, attempts: int = 30) -> None:

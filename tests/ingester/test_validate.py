@@ -135,3 +135,80 @@ def test_valid_enums_pass():
         assert ok(base(content_type=ct))["content_type"] == ct
     for d in ("redirect", "proxied", "error"):
         assert ok(base(delivery=d))["delivery"] == d
+
+
+# ------------------------------------------------------------- round-3 poison
+# Every case here used to pass validation and blow up later: at INSERT time
+# (NUL / surrogates / NaN in jsonb) or inside the worker (int(nan // 60),
+# to_timestamp(1e308)).
+
+
+def test_nonfinite_ts_quarantined():
+    assert quarantined(base(ts=float("nan"))) == "invalid_ts"
+    assert quarantined(base(ts=float("inf"))) == "invalid_ts"
+    assert quarantined(base(ts=float("-inf"))) == "invalid_ts"
+    assert quarantined(base(ts=1e308)) == "ts_in_future"
+
+
+def test_far_future_ts_quarantined():
+    import time as _t
+    assert quarantined(base(ts=_t.time() + 3 * 86400)) == "ts_in_future"
+    # a day of skew tolerance remains acceptable (steady-skew is C-scenario
+    # domain data, not poison)
+    ok(base(ts=_t.time() + 3600))
+
+
+def test_nul_stripped_from_strings():
+    row = ok(base(user_agent="bad\x00agent"))
+    assert row["user_agent"] == "bad\ufffdagent"
+    assert row["_sanitized"] == ["user_agent"]
+
+
+def test_lone_surrogate_replaced():
+    row = ok(base(channel_id="ch\ud8001"))
+    assert row["channel_id"] == "ch\ufffd1"
+    assert row["_sanitized"] == ["channel_id"]
+
+
+def test_raw_sanitized_recursively():
+    e = base(metadata={"nested": ["keep", "nul\x00", {"deep": "sur\ud800"}]},
+             custom=1.5)
+    row = ok(e)
+    assert row["raw"]["metadata"]["nested"][1] == "nul\ufffd"
+    assert row["raw"]["metadata"]["nested"][2]["deep"] == "sur\ufffd"
+    assert row["raw"]["custom"] == 1.5
+    # unknown/nested keys are attributed to "raw" so the metric label stays
+    # bounded (a client-controlled label would be a cardinality bomb)
+    assert set(row["_sanitized"]) == {"raw"}
+
+
+def test_nan_in_raw_becomes_string():
+    row = ok(base(custom_metric=float("nan")))
+    assert row["raw"]["custom_metric"] == "NaN"
+    row = ok(base(custom_metric=float("inf")))
+    assert row["raw"]["custom_metric"] == "Infinity"
+
+
+def test_nonfinite_number_fields_quarantined():
+    assert quarantined(base(manifest_refresh_hint=float("nan"))) \
+        == "invalid_manifest_refresh_hint"
+    assert quarantined(base(manifest_refresh_hint=float("inf"))) \
+        == "invalid_manifest_refresh_hint"
+
+
+def test_event_type_cap():
+    ok(base(event_type="t" * 64))
+    assert quarantined(base(event_type="t" * 65)) == "event_type_too_long"
+
+
+def test_sanitized_event_is_storable():
+    """The full guarantee: after validate_event, json.dumps(raw).encode()
+    succeeds and contains no NUL escape — i.e. Postgres jsonb accepts it."""
+    import json as _json
+    e = base(user_agent="a\x00b", channel_id="c\ud800d", pad="x" * 10)
+    e["weird"] = {"k\x00": ["s\ud800t", 1, None, True]}
+    row, reason = validate_event(e)
+    assert reason is None
+    encoded = _json.dumps(row["raw"]).encode("utf-8")
+    assert b"\\u0000" not in encoded
+    encoded.decode("utf-8")  # no surrogates left either

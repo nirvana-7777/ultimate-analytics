@@ -24,7 +24,8 @@ def conn(dsn):
     import psycopg
     c = psycopg.connect(dsn, autocommit=True)
     with c.cursor() as cur:
-        cur.execute("TRUNCATE events, sessions, rollup_1m, quarantine, gap_histogram")
+        cur.execute("TRUNCATE events, sessions, rollup_1m, quarantine, "
+                    "gap_histogram, worker_state")
     yield c
     c.close()
 
@@ -38,4 +39,6 @@ def cfg(dsn):
         raw_retention_days=14, quarantine_retention_days=7,
         rollup_bucket_cap=720, max_events_age_s=3600.0, worker_tick_s=60.0,
         public_port=8000, internal_port=9000, log_level="warning",
+        max_events_per_batch=5000, worker_statement_timeout_ms=60000,
+        ddl_lock_timeout_ms=3000,
     )
