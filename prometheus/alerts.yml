@@ -1,13 +1,24 @@
 groups:
   - name: analytics
     rules:
+      # Every rule below reads series exported by these two jobs. If one dies, those
+      # series go absent and the rules stay silent instead of firing, so this is the
+      # only rule that catches a dead ingester/worker.
+      - alert: AnalyticsTargetDown
+        expr: up{job=~"ingester|worker"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.instance }}) is not being scraped"
+
       # Ingest gap (doc §7): the only outage signal — the backend sends no
       # drop counters. Fires when a sender that was active in the last hour
       # has produced nothing for >10 min.
       - alert: AnalyticsIngestGap
         expr: >
-          (time() - analytics_last_event_ts > 600)
-          and on(sender) (increase(analytics_events_received_total[1h]) > 0)
+          (time() - max by (sender) (analytics_last_event_ts) > 600)
+          and on(sender)
+          (sum by (sender) (increase(analytics_events_received_total[1h])) > 0)
         for: 2m
         labels: { severity: page }
         annotations:

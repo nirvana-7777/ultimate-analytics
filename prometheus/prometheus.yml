@@ -5,7 +5,17 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
+# TODO: alerts.yml labels rules severity page/ticket but nothing routes them yet.
+# Point this at your Alertmanager (or use Grafana-managed alerting) and enable it:
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
 scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
   # Internal listener: /healthz /readyz /metrics are auth-exempt by design
   # (Docker-network only; Caddy only exposes the public listener).
   - job_name: ingester

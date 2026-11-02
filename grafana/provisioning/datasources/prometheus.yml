@@ -6,3 +6,8 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: false
+    editable: false
+    jsonData:
+      # Must match scrape_interval so $__rate_interval is computed correctly.
+      timeInterval: 15s
+      httpMethod: POST

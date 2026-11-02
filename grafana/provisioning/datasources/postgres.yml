@@ -5,13 +5,18 @@ datasources:
     type: grafana-postgresql-datasource
     access: proxy
     url: postgres:5432
-    user: analytics
+    # Dedicated read-only role, see postgres/grafana_ro.sql (not the ingest/worker role).
+    user: grafana_ro
     isDefault: true
+    editable: false
     secureJsonData:
-      password: ${ANALYTICS_PG_PASSWORD}
+      password: ${GRAFANA_PG_PASSWORD}
     jsonData:
       database: analytics
+      # Plaintext is acceptable on the private Docker network only; use require/verify-full across hosts.
       sslmode: disable
       postgresVersion: 1600
       timescaledb: false
-      maxOpenConns: 20
+      maxOpenConns: 5
+      maxIdleConns: 5
+      connMaxLifetime: 14400
