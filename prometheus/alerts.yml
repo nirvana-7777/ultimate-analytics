@@ -64,3 +64,14 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "Per-event insert fallback fired — an unknown poison is passing validation"
+
+      # Round-4: the outage catch-up clamp abandoned received_at backlog older
+      # than ANALYTICS_MAX_EVENTS_AGE_S. A jump means the worker was down (or
+      # failing) long enough that data outside the clamp was never processed —
+      # check what else happened while it was down.
+      - alert: AnalyticsBacklogAbandoned
+        expr: increase(analytics_worker_backlog_abandoned_seconds_total[1h]) > 0
+        for: 0m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Worker clamped its discovery window — {{ $value }}s of received_at backlog abandoned (outage recovery)"

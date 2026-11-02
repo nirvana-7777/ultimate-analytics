@@ -98,3 +98,40 @@ def test_two_views_behind_nat_do_not_fragment(conn, cfg):
     assert count == 2, "one continuous session per channel, not 20 fragments"
     assert events == 20
     assert min_dur >= 250, "each session spans the whole 5-minute window"
+
+
+def test_zap_aba_is_one_spanning_session_per_key(conn, cfg):
+    """Round-4 review — the OTHER side of the same trade, now DELIBERATE and
+    pinned: a single viewer zapping A→B→A within SESSION_GAP_S produces ONE
+    A session that SPANS the B time (duration includes the away-time) plus
+    one B session — NOT three time-ordered fragments. Time-ordered splitting
+    is exactly what fragmented the two-TVs-behind-one-NAT case above; fixing
+    both needs a device id in the contract (v2), not a smarter ordering.
+    See the DELIBERATE SEMANTICS note in worker/sessionizer.py."""
+    now = time.time()
+    with conn.cursor() as cur:
+        # viewer on chA, zaps to chB, zaps back — all gaps < 120 s
+        insert_event(cur, now - 300, channel="chA", ip="198.51.100.40")
+        insert_event(cur, now - 240, channel="chA", ip="198.51.100.40")
+        insert_event(cur, now - 210, channel="chB", ip="198.51.100.40")
+        insert_event(cur, now - 200, channel="chB", ip="198.51.100.40")
+        insert_event(cur, now - 190, channel="chA", ip="198.51.100.40")
+        # chA gap: -240 -> -190 = 50 s < 120 s, so chA stays ONE session
+    rebuild(conn, cfg, now - 3600)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT channel_id, started_at, ended_at, duration_s, event_count
+            FROM sessions WHERE client_ip = '198.51.100.40'
+            ORDER BY channel_id""")
+        rows = cur.fetchall()
+    assert len(rows) == 2, "one session per key (A spans the B time), not 3 fragments"
+    (ch_a, st_a, en_a, dur_a, n_a), (ch_b, st_b, en_b, dur_b, n_b) = rows
+    assert ch_a == "chA" and ch_b == "chB"
+    assert n_a == 3 and n_b == 2
+    # the A session spans from its first to its last event, across the B time
+    assert abs(st_a - (now - 300)) < 1 and abs(en_a - (now - 190)) < 1
+    assert abs(dur_a - 110) < 1, "A duration includes the away-time (deliberate)"
+    assert abs(st_b - (now - 210)) < 1 and abs(dur_b - 10) < 1
+    # ...and the two sessions overlap in time (the known cost of the trade)
+    assert st_b > st_a and en_b < en_a

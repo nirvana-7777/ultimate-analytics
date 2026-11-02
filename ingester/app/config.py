@@ -1,6 +1,11 @@
 import os
 from dataclasses import dataclass
 
+# Discovery re-reads received_at this far before the anchor. received_at is
+# the ingest transaction START, so a slow ingest commit can land after the
+# worker's discovery query. Everything downstream is idempotent: be generous.
+DISCOVERY_OVERLAP_S = 30.0
+
 
 def _b(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
@@ -28,6 +33,13 @@ class Config:
     max_events_per_batch: int
     worker_statement_timeout_ms: int
     ddl_lock_timeout_ms: int
+    # Round-4 review: event_type metric labels are allowlist-bounded (the
+    # 64-char cap bounded only LENGTH, not the number of distinct labels).
+    known_event_types: frozenset = frozenset({"manifest_request"})
+    # Round-4 privacy: sessions carry client_ip (personal data) — bounded
+    # retention like events/quarantine. Aggregates (rollup_1m, gap_histogram)
+    # hold no personal data and are kept indefinitely.
+    sessions_retention_days: int = 90
 
 
 def load() -> Config:
@@ -56,4 +68,13 @@ def load() -> Config:
         # Partition DDL must never queue behind (or hold up) ingest inserts;
         # bail out fast instead and retry next tick (blocker 4).
         ddl_lock_timeout_ms=int(os.environ.get("ANALYTICS_DDL_LOCK_TIMEOUT_MS", "3000")),
+        # Round-4: unknown event_type values are counted under the single
+        # label "other" — only allowlisted types get their own series.
+        known_event_types=frozenset(
+            s.strip() for s in os.environ.get(
+                "ANALYTICS_KNOWN_EVENT_TYPES", "manifest_request").split(",")
+            if s.strip()),
+        # Round-4 privacy: per-session rows (client_ip) expire; aggregates do not.
+        sessions_retention_days=int(os.environ.get(
+            "ANALYTICS_SESSIONS_RETENTION_DAYS", "90")),
     )

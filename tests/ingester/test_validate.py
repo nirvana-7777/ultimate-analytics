@@ -212,3 +212,85 @@ def test_sanitized_event_is_storable():
     encoded = _json.dumps(row["raw"]).encode("utf-8")
     assert b"\\u0000" not in encoded
     encoded.decode("utf-8")  # no surrogates left either
+
+
+# ------------------------------------------------------------- round-4 poison
+# The validator itself must never raise (review blocker 1, round 4):
+# Python's JSON parser accepts 400-digit ints and 10k-deep structures, and
+# float()/math.isfinite()/the recursive sanitizer all blow up on them —
+# which used to escape as a 503 and drop the WHOLE batch.
+
+
+def test_huge_int_ts_quarantined_not_overflowerror():
+    # math.isfinite(10**400) and float(10**400) raise OverflowError; ints
+    # are compared as ints now (exact, unraisable).
+    assert quarantined(base(ts=10**400)) == "ts_in_future"
+    assert quarantined(base(ts=-(10**400))) == "invalid_ts"
+    assert quarantined(base(ts=10**12)) == "ts_in_future"   # hard cap, int
+    assert quarantined(base(ts=2**60)) == "ts_in_future"    # far beyond cap
+    assert quarantined(base(ts=1e12)) == "ts_in_future"     # hard cap, float
+    # plausible int ts from a backend (whole seconds, in the past) is fine
+    row = ok(base(ts=1700000000))
+    assert row["ts"] == 1700000000.0 and isinstance(row["ts"], float)
+    # int just past now+MAX_TS_FUTURE_S is poison, not skew (same as floats)
+    import time as _t
+    assert quarantined(base(ts=int(_t.time()) + 86401)) == "ts_in_future"
+
+
+def test_huge_int_number_fields_quarantined():
+    # float(10**400) in _clean_num used to raise OverflowError. No future
+    # check on this field — only the float-exactness bound.
+    assert quarantined(base(manifest_refresh_hint=10**400)) \
+        == "invalid_manifest_refresh_hint"
+    assert quarantined(base(manifest_refresh_hint=-(10**400))) \
+        == "invalid_manifest_refresh_hint"
+    ok(base(manifest_refresh_hint=2**53))
+
+
+def _nest(depth, leaf):
+    o = leaf
+    for _ in range(depth):
+        o = {"n": [o]}
+    return o
+
+
+def test_too_deep_raw_quarantined_not_recursionerror():
+    # _sanitize_obj recurses once per level and would hit RecursionError
+    # (~1000 deep); json.dumps for the jsonb INSERT recurses too. The depth
+    # cap fires first and the event is quarantined whole.
+    assert quarantined(base(nested=_nest(500, "deep"))) == "raw_too_deep"
+    assert quarantined(base(nested=_nest(5000, "deeper"))) == "raw_too_deep"
+    # ...while plausible nesting sails through untouched
+    row = ok(base(nested=_nest(20, {"still": "here"})))
+    node = row["raw"]["nested"]
+    while isinstance(node, dict) and "n" in node:
+        node = node["n"][0]  # unwrap {"n": [child]} levels
+    assert node == {"still": "here"}
+
+
+def test_validate_event_never_raises():
+    """The contract, swept: none of these may raise, whatever happens —
+    each returns (row|None, reason|None) and the batch survives."""
+    nasty = [
+        base(ts=10**400),
+        base(ts=float("nan")),
+        base(ts=float("inf")),
+        base(manifest_refresh_hint=10**999),
+        base(nested=_nest(3000, "deep")),
+        base(nested=_nest(3000, [float("nan"), {"k\x00": 1}])),
+        base(event_type=10**100),
+        "not a dict",
+        [1, 2, 3],
+        None,
+        42,
+        {"only": "keys", "no": "ts"},
+        {"schema_version": 1, "ts": 10**400, "event_type": None},
+        {"schema_version": 1, "ts": 1.0, "event_type": "x",
+         "raw poison": _nest(2000, "deep")},
+    ]
+    for e in nasty:
+        row, reason = validate_event(e)
+        assert (row is None) == (reason is not None), e
+        assert reason is None or isinstance(reason, str)
+    # the good event still passes through the same gauntlet
+    assert ok(base())["provider"] == "edge-a"

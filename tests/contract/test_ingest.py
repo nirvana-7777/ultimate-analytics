@@ -298,3 +298,89 @@ def test_insert_fallback_quarantines_only_the_bad_event(monkeypatch):
     assert _quarantine_count("insert_failed") == 1
     assert _fetch_event("WHERE client_ip = '203.0.113.52'") is None
     assert _fetch_event("WHERE client_ip = '203.0.113.53'") is not None
+
+
+def test_validator_error_quarantined_batch_survives(monkeypatch):
+    """Round-4 blocker 1: NOTHING validate_event does may 503 the batch.
+    A validator crash (simulated: raises on one event) must quarantine that
+    event as validator_error with a 202, and the rest of the batch must
+    still land."""
+    import app.main as m
+    real_validate = m.validate_event
+
+    def explodes_on_marked(e):
+        if isinstance(e, dict) and e.get("user_agent") == "crash-me":
+            raise RuntimeError("simulated validator bug")
+        return real_validate(e)
+
+    monkeypatch.setattr(m, "validate_event", explodes_on_marked)
+    try:
+        r = _post({"events": [
+            _event(user_agent="crash-me", client_ip="203.0.113.54"),
+            _event(user_agent="fine", client_ip="203.0.113.55"),
+        ]})
+    finally:
+        monkeypatch.undo()
+    assert r.status_code == 202
+    assert _quarantine_count("validator_error") == 1
+    assert _fetch_event("WHERE client_ip = '203.0.113.54'") is None
+    assert _fetch_event("WHERE client_ip = '203.0.113.55'") is not None
+
+
+def test_huge_int_ts_quarantined_batch_survives():
+    """Round-4 blocker 1, end to end: Python's JSON parser accepts a
+    400-digit integer; float(10**400) raises OverflowError and used to 503
+    the whole batch from inside the validator."""
+    ev_ok = _event(client_ip="203.0.113.56")
+    ev_big = _event(client_ip="203.0.113.57")
+    ev_big["ts"] = 10**400  # int, not float — json.dumps writes it verbatim
+    ev_hint = _event(client_ip="203.0.113.58")
+    ev_hint["manifest_refresh_hint"] = -(10**400)
+    r = _post({"events": [ev_big, ev_ok, ev_hint]})
+    assert r.status_code == 202
+    assert _quarantine_count("ts_in_future") == 1
+    assert _quarantine_count("invalid_manifest_refresh_hint") == 1
+    assert _fetch_event("WHERE client_ip = '203.0.113.56'") is not None
+    assert _fetch_event("WHERE client_ip = '203.0.113.57'") is None
+
+
+def test_deeply_nested_raw_quarantined_batch_survives():
+    """Round-4 blocker 1, end to end: a 500-deep raw used to die with
+    RecursionError in the sanitizer / jsonb dump -> 503 -> dropped batch.
+    Now: quarantined whole as raw_too_deep, and the quarantine row itself
+    is storable (stub raw)."""
+    ev_ok = _event(client_ip="203.0.113.59")
+    ev_deep = _event(client_ip="203.0.113.60")
+    node = "deep"
+    for _ in range(500):
+        node = {"n": [node]}
+    ev_deep["payload"] = node
+    r = _post({"events": [ev_deep, ev_ok]})
+    assert r.status_code == 202
+    assert _quarantine_count("raw_too_deep") == 1
+    assert _fetch_event("WHERE client_ip = '203.0.113.60'") is None
+    assert _fetch_event("WHERE client_ip = '203.0.113.59'") is not None
+    # the quarantine row (with its stubbed raw) actually landed in the DB
+    with conn_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT raw FROM quarantine WHERE reason = 'raw_too_deep'")
+        assert cur.fetchone() is not None
+
+
+def test_unknown_event_type_label_is_allowlist_bounded():
+    """Round-4 should-fix: the 64-char cap bounded label LENGTH, not COUNT.
+    Unknown types are counted under the single label 'other'; which types
+    arrived stays queryable in events.raw."""
+    from app import metrics as m
+    before = m.EVENTS_UNKNOWN_TYPE.labels(event_type="other")._value.get()
+    r = _post({"events": [
+        _event(event_type="mystery_type_aaa", client_ip="203.0.113.61"),
+        _event(event_type="mystery_type_bbb", client_ip="203.0.113.62"),
+    ]})
+    assert r.status_code == 202
+    after = m.EVENTS_UNKNOWN_TYPE.labels(event_type="other")._value.get()
+    assert after - before == 2
+    # no per-value series were ever created — the label set cannot grow
+    assert ("mystery_type_aaa",) not in m.EVENTS_UNKNOWN_TYPE._metrics
+    assert ("mystery_type_bbb",) not in m.EVENTS_UNKNOWN_TYPE._metrics
+    # the events themselves still carry their real type (queryable)
+    assert _fetch_event("WHERE client_ip = '203.0.113.61'")[1] == "mystery_type_aaa"

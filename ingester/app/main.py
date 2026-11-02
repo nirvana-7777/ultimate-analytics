@@ -22,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import metrics
 from .config import load
-from .db import make_pool, wait_for_pg
+from .db import POISON_ERRORS, make_pool, wait_for_pg
 from .partitions import ensure_ahead
 from .validate import _sanitize_obj, validate_event
 
@@ -88,13 +88,37 @@ def _check_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=401)
 
 
+def _quarantine_raw(e) -> dict:
+    """Sanitized copy for the quarantine row — must itself never raise.
+
+    A raw too deep to sanitize (or otherwise unfit for jsonb) is stored as a
+    stub: one degraded quarantine row beats a 503 that drops the whole batch
+    over the quarantine path (round-4 blocker 1 — the poison was hiding in
+    the handler's other INSERT, again).
+    """
+    try:
+        e2, _touched = _sanitize_obj(e, None)
+        return e2
+    except Exception:
+        return {"quarantine_note": "raw unsanitizable (too deep or not JSON)"}
+
+
 def _ingest_sync(events: list, sender: str) -> Response:
     t0 = time.perf_counter()
     status = "202"
     try:
         good, quarantined = [], []
         for e in events:
-            row, reason = validate_event(e)
+            try:
+                row, reason = validate_event(e)
+            except Exception as exc:
+                # Round-4 blocker 1: the int guard and the depth cap close the
+                # known raisers, but the contract is stronger than the bug
+                # list — NOTHING a single event does here may 503 the batch
+                # (at-most-once => dropped data). Unknown unknowns are
+                # quarantined as validator_error and the batch stays 202.
+                log.warning("validator raised; quarantining event: %s", exc)
+                row, reason = None, "validator_error"
             if reason is None:
                 sanitized = row.pop("_sanitized", None)
                 if sanitized:
@@ -106,8 +130,7 @@ def _ingest_sync(events: list, sender: str) -> Response:
                 # NUL string in the raw would make the quarantine executemany
                 # fail -> 503 -> dropped batch (found by the round-3 tests —
                 # the poison was hiding in the handler's other INSERT).
-                e2, _touched = _sanitize_obj(e, None)
-                quarantined.append((reason, e2))
+                quarantined.append((reason, _quarantine_raw(e)))
 
         now_ts = time.time()
         with pool.connection() as conn, conn.cursor() as cur:
@@ -128,8 +151,12 @@ def _ingest_sync(events: list, sender: str) -> Response:
                 metrics.INGEST_LAG.labels(sender=sender).observe(lag)
                 if lag > cfg.max_events_age_s:
                     metrics.EVENTS_LATE.inc()
-                if r["event_type"] != "manifest_request":
-                    metrics.EVENTS_UNKNOWN_TYPE.labels(event_type=r["event_type"]).inc()
+                if r["event_type"] not in cfg.known_event_types:
+                    # Round-4 should-fix: the 64-char cap bounded the label's
+                    # LENGTH, not its cardinality. The label set is now the
+                    # allowlist + "other"; WHICH unknown types arrived stays
+                    # queryable in events.raw (14-day retention).
+                    metrics.EVENTS_UNKNOWN_TYPE.labels(event_type="other").inc()
         metrics.INGEST_REQUESTS.labels(status="202").inc()
         return Response(status_code=202)
     except Exception:
@@ -148,12 +175,19 @@ def _ingest_sync(events: list, sender: str) -> Response:
 
 def _insert_events(cur, good: list) -> tuple[list, list]:
     """Fast path: one executemany. Poison path: fall back to per-event inserts
-    under savepoints so only the offending event is quarantined (review
+    under savepoints so only the offending event is quarantined (round-3
     blocker 3) — a 503 here means the backend drops the whole batch.
+
+    Round-4 blocker 5: only POISON_ERRORS (DataError/IntegrityError) take the
+    per-event fallback. A QueryCanceled (statement timeout) or a connection
+    error is environmental: falling back per row there would "quarantine"
+    rows that never got a fair insert attempt and answer 202 — silent data
+    loss dressed as quarantine. Those propagate to the caller -> 503, which
+    the backend handles per its contract (back off, drop).
 
     Defense in depth: validate_event already rejects/sanitizes everything we
     know can poison Postgres (NUL, surrogates, NaN/Infinity/huge ts, oversized
-    fields); this loop catches the unknown unknowns.
+    fields, runaway depth); this loop catches the unknown unknowns.
 
     Returns (inserted_rows, [(reason, raw), ...] to quarantine).
     """
@@ -162,7 +196,7 @@ def _insert_events(cur, good: list) -> tuple[list, list]:
         with cur.connection.transaction():
             cur.executemany(INSERT_EVENT_SQL, params)
         return good, []
-    except psycopg.Error as first:
+    except POISON_ERRORS as first:
         # The failed block was rolled back by the context manager; the
         # transaction (pool connection) is healthy again — start over row by
         # row, each in its own nested block.
@@ -176,7 +210,7 @@ def _insert_events(cur, good: list) -> tuple[list, list]:
             with cur.connection.transaction():
                 cur.execute(INSERT_EVENT_SQL, dict(r, raw=Jsonb(r["raw"])))
             inserted.append(r)
-        except psycopg.Error as e:
+        except POISON_ERRORS as e:
             log.warning("event quarantined at insert: %s", str(e).splitlines()[0])
             failed.append(("insert_failed", r["raw"]))
     return inserted, failed
@@ -197,10 +231,16 @@ async def ingest(request: Request, authorization: str | None = Header(default=No
             metrics.INGEST_REQUESTS.labels(status="413").inc()
             raise HTTPException(status_code=413)
 
-    body = await request.body()
-    if len(body) > MAX_BODY:
-        metrics.INGEST_REQUESTS.labels(status="413").inc()
-        raise HTTPException(status_code=413)
+    # Enforce MAX_BODY while streaming: chunked requests carry no
+    # Content-Length, and request.body() would buffer them unbounded.
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY:
+            metrics.INGEST_REQUESTS.labels(status="413").inc()
+            raise HTTPException(status_code=413)
+        chunks.append(chunk)
+    body = b"".join(chunks)
 
     try:
         payload = json.loads(body)

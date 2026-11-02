@@ -24,16 +24,27 @@ Round-3 review hardening:
     without touching them: PostgreSQL treats NaN as greater than everything,
     so `NaN < max` is FALSE and NaN never reaches floor(); 1e308 likewise.
     (ingest rejects them and migration 002 scrubs them — this is layer 3.)
-  * every bucket runs under its own SAVEPOINT: one poisoned bucket is
+  * every bucket runs under its own SAVEPOINT: one data-poisoned bucket is
     counted in analytics_rollup_bucket_errors_total and skipped, not allowed
     to abort the whole core transaction (review blocker 1's wedge shape).
+
+Round-4 review (blocker 5): the per-bucket catch is POISON_ERRORS only
+(DataError/IntegrityError). A timeout, connection error or trigger bug
+propagates, the whole core transaction rolls back and the anchor does NOT
+advance — the old broad `except psycopg.Error` skipped the bucket, kept its
+stale data, and counted the tick "ok" while the anchor moved past it.
 """
 import logging
 import math
 
-import psycopg
-
 from app import metrics
+from app.config import DISCOVERY_OVERLAP_S
+from app.db import POISON_ERRORS
+# TS_HARD_MAX is imported from app.validate (single source of truth: ingest
+# rejects at/above it as ts_in_future; the range predicates below are the
+# DB-side layer of the same rule). It is re-exported here for
+# worker.sessionizer and the tests.
+from app.validate import TS_HARD_MAX  # noqa: F401
 
 log = logging.getLogger("worker.rollup")
 
@@ -78,11 +89,6 @@ INSERT_ROLLUP_SQL = """
     ) sess USING (provider, channel_id, content_type, delivery, country)
 """
 
-# Absolute sanity bound for ts (epoch seconds; 1e12 ≈ year 33 654). Anything
-# above is poison by definition; also excludes NaN (NaN < 1e12 is FALSE).
-TS_HARD_MAX = 1e12
-
-
 def _bucket(ts: float) -> int:
     return int(ts // 60) * 60
 
@@ -100,7 +106,7 @@ def recompute_touched(cur, cfg, rewritten, deleted_starts, last_run_start: float
         FROM events
         WHERE received_at >= to_timestamp(%s)
           AND ts >= %s AND ts < %s
-    """, (last_run_start - 5.0, min_ts, TS_HARD_MAX))
+    """, (last_run_start - DISCOVERY_OVERLAP_S, min_ts, TS_HARD_MAX))
     buckets: set[int] = {int(b) * 60 for (b,) in cur.fetchall()}
 
     # Too-old events in the discovery window: dropped by the range predicate
@@ -108,7 +114,7 @@ def recompute_touched(cur, cfg, rewritten, deleted_starts, last_run_start: float
     cur.execute("""
         SELECT count(*) FROM events
         WHERE received_at >= to_timestamp(%s) AND ts < %s
-    """, (last_run_start - 5.0, min_ts))
+    """, (last_run_start - DISCOVERY_OVERLAP_S, min_ts))
     dropped += cur.fetchone()[0]
 
     # Buckets whose session set changed (inserts AND the starts deleted away).
@@ -127,15 +133,19 @@ def recompute_touched(cur, cfg, rewritten, deleted_starts, last_run_start: float
         metrics.ROLLUP_DROPPED_LATE.inc(dropped)
 
     for b in sorted(buckets):
-        # One bad bucket must not abort the core transaction (which holds the
-        # sessionize work too). conn.transaction() nests as a SAVEPOINT inside
-        # the worker's tick transaction and as BEGIN/COMMIT on an autocommit
-        # connection (tests) — one code path, both modes.
+        # One data-poisoned bucket must not abort the core transaction (which
+        # holds the sessionize work too). conn.transaction() nests as a
+        # SAVEPOINT inside the worker's tick transaction and as BEGIN/COMMIT on
+        # an autocommit connection (tests) — one code path, both modes.
+        # Round-4 blocker 5: POISON_ERRORS only — a timeout / connection
+        # error / trigger bug propagates and rolls back the whole tick, so
+        # the anchor cannot advance past a bucket that still holds stale
+        # data (the old broad catch skipped it and counted the tick "ok").
         try:
             with cur.connection.transaction():
                 cur.execute("DELETE FROM rollup_1m WHERE bucket = to_timestamp(%s)", (b,))
                 cur.execute(INSERT_ROLLUP_SQL, (b, b, b + 60, b, b + 60))
-        except psycopg.Error as e:
+        except POISON_ERRORS as e:
             metrics.ROLLUP_BUCKET_ERRORS.inc()
-            log.warning("rollup bucket %s skipped after error: %s",
+            log.warning("rollup bucket %s skipped after data-level error: %s",
                         b, str(e).splitlines()[0])

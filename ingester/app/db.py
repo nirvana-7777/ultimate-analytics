@@ -16,6 +16,21 @@ MIGRATIONS_DIR = Path(os.environ.get(
 ))
 MIGRATOR_LOCK_KEY = 0x5E55_AA01  # arbitrary but stable
 
+# Round-4 review, blocker 5: the ONLY exceptions that mean "this ROW is
+# poison" and may be contained by a per-row/per-bucket fallback.
+#   DataError       — SQLSTATE class 22: invalid text representation, NUL in
+#                     text, numeric out of range, bad jsonb, ...
+#   IntegrityError  — SQLSTATE class 23: CHECK / UNIQUE / FK violations.
+# Everything else is environmental and MUST propagate:
+#   QueryCanceled   — statement timeout (subclass of OperationalError): a
+#                     timed-out bulk insert must not "fall back per row" and
+#                     quarantine rows that never got a fair attempt;
+#   OperationalError — dead/reset connection: the fallback rows would all
+#                     fail and be silently dropped or skipped;
+#   RaiseException / ProgrammingError — a trigger or a code bug: rolling the
+#                     tick back (or answering 503) is what makes it visible.
+POISON_ERRORS = (psycopg.DataError, psycopg.IntegrityError)
+
 
 def make_pool(
     dsn: str,

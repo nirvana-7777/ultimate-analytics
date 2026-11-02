@@ -17,25 +17,49 @@ gap > SESSION_GAP_S. Canonical operation is a scoped rebuild per dirty IP:
      event, otherwise a run older than the window would be head-truncated
   4. close_stale runs globally, independent of discovery (round-2 B fix)
 
+DELIBERATE SEMANTICS — key-grouped gap-checking (round-4 review, made
+explicit and pinned by tests both ways): events are grouped per
+(client_ip, content_type, channel_id) and gaps are measured WITHIN a group,
+not in ts-interleaved order across the IP.
+
+  + Two viewers behind one NAT on different channels: each key's stream
+    stays continuous — no cross-channel fragmentation
+    (test_two_views_behind_nat_do_not_fragment).
+  − One viewer zapping A→B→A within SESSION_GAP_S: ONE A session that
+    SPANS the B time (duration includes the away-time) plus one B session,
+    instead of three fragments (test_zap_aba_...).
+
+The NAT case is the deployed reality (TV boxes behind home routers) and
+cannot be solved without a device id; the zap case is rarer and its
+distortion is bounded by the gap. Time-ordered splitting per IP is exactly
+what produced the NAT fragmentation — reversing this trade needs a device
+id in the contract (v2), not a smarter ordering.
+
 Round-3 review: the rebuild was ~5 queries PER DIRTY IP and a restart rewound
 a full hour. It is now ~6 queries per TICK (discovery, has-prior, delete,
 first-build minima, one fetch, one insert batch), and restarts resume from the
 persisted anchor instead of re-bursting. Non-finite ts rows are skipped
 (ingest rejects them and migration 002 scrubs them, but the sessionizer reads
 the DB, not the API).
+
+Round-4 review (blocker 5): per-row insert fallback catches ONLY data-level
+errors now. A timeout or connection error propagates, the whole core
+transaction rolls back — including the session DELETEs above — and the
+anchor does not advance. The old broad catch swallowed the insert error
+AFTER the deletes had committed per-row: those sessions were simply lost,
+with the tick counted "ok" and the anchor moved.
 """
 import logging
 import math
 from collections import Counter, defaultdict
 
-import psycopg
-
 from app import metrics
-from worker.rollup import TS_HARD_MAX
+from app.config import DISCOVERY_OVERLAP_S
+from app.db import POISON_ERRORS
+from app.validate import TS_HARD_MAX
 
 log = logging.getLogger("worker.sessionizer")
 
-DISCOVERY_OVERLAP_S = 5.0  # small overlap; discovery is idempotent anyway
 PRIO = {"error": 2, "proxied": 1, "redirect": 0}  # delivery tie-break priority
 
 INSERT_SESSION_SQL = """
@@ -106,20 +130,26 @@ def rebuild_dirty(cur, cfg, last_run_start: float) -> tuple[list[float], list[fl
             if m is not None:
                 anchors[ip] = min(anchors[ip], float(m))
 
-    # --- one fetch for every dirty IP, ordered by the split key -------------
-    floor_anchor = min(anchors.values())
+    # --- one fetch, each IP bounded by ITS OWN anchor ------------------------
+    # A single IP with old history must not drag every other dirty IP's events
+    # back to its anchor (memory + statement_timeout on first deploy/outage).
+    ips = list(anchors)
     cur.execute("""
-        SELECT client_ip, content_type, channel_id, provider, delivery, country, ts
-        FROM events
-        WHERE client_ip = ANY(%s) AND channel_id IS NOT NULL AND ts >= %s
-        ORDER BY client_ip, content_type, channel_id, ts
-    """, (dirty, floor_anchor))
+        SELECT e.client_ip, e.content_type, e.channel_id, e.provider,
+               e.delivery, e.country, e.ts
+        FROM events e
+        JOIN unnest(%s::text[], %s::float8[]) AS a(ip, anchor)
+          ON e.client_ip = a.ip AND e.ts >= a.anchor
+        WHERE e.channel_id IS NOT NULL
+        ORDER BY e.client_ip, e.content_type, e.channel_id, e.ts
+    """, (ips, [anchors[ip] for ip in ips]))
     rows = cur.fetchall()
 
     # Split on channel change, content_type change, or gap > SESSION_GAP_S.
     # Rows arrive grouped by (client_ip, content_type, channel_id): a key
-    # change always splits (equivalent to the old ts-ordered pass), gaps split
-    # within a group. Events below the IP's own anchor are skipped (they
+    # change always splits, gaps split within a group — see the DELIBERATE
+    # SEMANTICS note in the module header (NAT vs zap tradeoff, pinned by
+    # tests). Events below the IP's own anchor are skipped (they
     # belong to sessions outside this rebuild's scope).
     rewritten: list[float] = []
     sess_rows: list[tuple] = []
@@ -170,15 +200,23 @@ def rebuild_dirty(cur, cfg, last_run_start: float) -> tuple[list[float], list[fl
 
 
 def _insert_sessions(cur, sess_rows: list[tuple]) -> None:
-    """Fast path executemany; on poison, roll back and retry per row so one
-    bad row cannot abort the whole core transaction (symmetry with the
-    ingester's per-event fallback). conn.transaction() nests as a SAVEPOINT
-    inside the tick transaction, and as BEGIN/COMMIT on autocommit
-    connections (tests) — one code path, both modes."""
+    """Fast path executemany; on a DATA-LEVEL poison, roll back and retry per
+    row so one bad row cannot abort the whole core transaction (symmetry with
+    the ingester's per-event fallback). conn.transaction() nests as a
+    SAVEPOINT inside the tick transaction, and as BEGIN/COMMIT on autocommit
+    connections (tests) — one code path, both modes.
+
+    Round-4 blocker 5: only POISON_ERRORS (DataError/IntegrityError) take the
+    fallback. Anything else (timeout, dead connection) propagates: the core
+    transaction rolls back — INCLUDING the session DELETEs that already ran
+    in rebuild_dirty — and the anchor stays. The old broad `except
+    psycopg.Error` swallowed the insert error after those deletes: the
+    sessions were gone for good while the tick reported success.
+    """
     try:
         with cur.connection.transaction():
             cur.executemany(INSERT_SESSION_SQL, sess_rows)
-    except psycopg.Error as e:
+    except POISON_ERRORS as e:
         metrics.SESSION_INSERT_ERRORS.inc()
         log.warning("bulk session insert failed (%s); per-row retry",
                     str(e).splitlines()[0])
@@ -186,8 +224,8 @@ def _insert_sessions(cur, sess_rows: list[tuple]) -> None:
             try:
                 with cur.connection.transaction():
                     cur.execute(INSERT_SESSION_SQL, row)
-            except psycopg.Error as e2:
-                log.warning("session row skipped after insert error: %s",
+            except POISON_ERRORS as e2:
+                log.warning("session row skipped after data-level insert error: %s",
                             str(e2).splitlines()[0])
 
 

@@ -10,7 +10,10 @@ EVENTS_SANITIZED = Counter(
     "(NUL/surrogate stripped, NaN/Infinity stringified) before insert",
     ["field"])  # bounded: known schema fields + "raw"
 EVENTS_UNKNOWN_TYPE = Counter(
-    "analytics_events_unknown_type_total", "events with unknown event_type", ["event_type"])
+    "analytics_events_unknown_type_total",
+    "events with event_type outside ANALYTICS_KNOWN_EVENT_TYPES (the label is "
+    "always 'other' — allowlist-bounded cardinality; which types arrived "
+    "stays queryable in events.raw)", ["event_type"])
 EVENTS_LATE = Counter(
     "analytics_events_late_total",
     "events older than ANALYTICS_MAX_EVENTS_AGE_S at ingest (ts regression / stale sender)")
@@ -44,6 +47,12 @@ EVENTS_IN_DEFAULT = Gauge(
     "maintenance failed/worker was down; ingest still works, fix the worker")
 WORKER_TICK = Counter(
     "analytics_worker_tick_total", "worker phase outcomes",
-    ["phase", "status"])  # phase: ddl|core|gap  status: ok|fail|skip
+    ["phase", "status"])  # phase: ddl|core|gap|retention  status: ok|fail|skip
 WORKER_LAG = Gauge(
     "analytics_worker_lag_seconds", "seconds since last successful core tick", ["phase"])
+WORKER_BACKLOG_ABANDONED = Counter(
+    "analytics_worker_backlog_abandoned_seconds",
+    "seconds of received_at discovery backlog skipped because the persisted "
+    "anchor was older than max_events_age_s (outage catch-up clamp — those "
+    "buckets are dropped by rollup anyway; a large jump means outage "
+    "recovery, check what else was missed while it was down)")

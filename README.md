@@ -84,14 +84,18 @@ sessionizer, these tell you which contract you broke:
 | `test_a3_long_across_rebuild` | 3 h session vs 15-min rebuild window | no head truncation on first build, no ~15-min fracture |
 | `test_b_departing` | no new events at all | close works even when the IP is not dirty |
 | `test_c_skew` | ts 20 min in the past, received now | data-driven re-roll; >1 h old dropped + counted; moved sessions fix the bucket they left |
-| `test_split_rules` | channel/gap/content_type changes; mixed deliveries; **two TVs behind one NAT** | split key incl. content_type; dominant delivery by count, ties error > proxied > redirect; per-key gaps (not per-event interleave) |
-| `test_poison` | NaN / ±Inf / 1e308 rows in events; DB-level landmine on one bucket; worker restart; DDL/gap failure | the tick never wedges: poison rows produce no sessions, bad buckets are skipped + counted, anchors resume instead of rewinding, phase failures are isolated, DEFAULT-partition rows get rescued |
+| `test_split_rules` | channel/gap/content_type changes; mixed deliveries; **two TVs behind one NAT**; **one viewer zapping A→B→A** | split key incl. content_type; dominant delivery by count, ties error > proxied > redirect; per-key gaps (not per-event interleave) — a deliberate, module-header-documented trade: NAT streams stay continuous, a zap-back yields ONE spanning session instead of three fragments |
+| `test_poison` | NaN / ±Inf / 1e308 / huge-int rows in events; data-level vs environmental landmines on one bucket; worker restart; anchor clamp after outage; DDL/gap failure | the tick never wedges: poison rows produce no sessions, data-level bucket errors are skipped + counted while environmental ones roll the tick back, anchors resume instead of rewinding and are clamped after an outage, phase failures are isolated (with gap backoff), DEFAULT-partition rows get rescued — inside the real worker's DDL transaction, not just autocommit — and per-session rows (client_ip) expire on retention |
 
 Contract tests additionally pin: poison batches stay 202 (only the bad event
 is quarantined or sanitized), the 5000-event request cap answers 413,
-`/docs` & `/openapi.json` are 404 on the public listener, and the per-event
+`/docs` & `/openapi.json` are 404 on the public listener, the per-event
 insert fallback (simulated DB constraint violation) quarantines exactly one
-event instead of 503ing the batch.
+event instead of 503ing the batch, a crashing validator quarantines as
+`validator_error` (round-4: nothing a single event does may 503 a batch),
+huge-int `ts` and 500-deep `raw` land in quarantine (not OverflowError /
+RecursionError), and unknown `event_type` values collapse into the single
+metric label `other` (allowlist-bounded cardinality).
 
 ## How the worker thinks about time
 
@@ -109,21 +113,41 @@ A tick has three phases, each its own transaction (round-3 review, blocker 2):
    AccessExclusiveLock on `events` (empirically confirmed on PG16), so this
    must never ride the long core transaction: ingest inserts would queue
    behind it until the tick commits. On lock timeout it bails and retries
-   next tick.
+   next tick. The DEFAULT-partition rescue runs as a savepoint under
+   `LOCK TABLE events IN ACCESS EXCLUSIVE MODE` (round-4: it only ever
+   worked in autocommit before — inside the DDL transaction the
+   CheckViolation left it in InFailedSqlTransaction).
 2. **core** — sessionize + close + rollup in ONE transaction guarded by
    `pg_try_advisory_xact_lock` (auto-released at rollback; the session-level
    variant leaked locks onto pooled connections and masked real errors).
-   Per-bucket and per-session failures roll back to savepoints and are
-   counted, never propagated.
+   Data-level failures (DataError/IntegrityError) roll back to savepoints
+   and are counted; environmental ones (timeout, connection, trigger bug)
+   roll back the whole tick — round-4 blocker 5: the old broad
+   `except psycopg.Error` swallowed them and advanced the anchor past
+   stale buckets / deleted-away sessions.
 3. **gap** — the day-scan gap histogram, isolated in its own transaction with
    its own failure handling; its cadence anchor lives in `worker_state`, so
-   it runs once per day, not once per restart.
+   it runs once per day, not once per restart. A FAILED day-scan backs off
+   10 minutes instead of burning its 60 s budget on every tick (round-4).
 
-Anchors (`worker_state.sessionize_last_run_start`, `worker_state.gap_hist_last_run`)
-advance in the same transaction as the work they guard. A failed tick
-re-processes exactly its window (idempotent) — a poisoned event cannot wedge
-the worker because its discovery window never grows. A restart resumes from
-the persisted anchor instead of rewinding a full hour.
+Anchor semantics (round-4 blockers 2 + 3):
+
+- The saved anchor is the **DB clock captured at the start of the tick**,
+  before any discovery query ran. An event whose ingest transaction commits
+  mid-tick (after discovery, before the tick's commit) has `received_at ≤`
+  that value, so the next tick's `received_at ≥ anchor − 5 s` rediscovers
+  it. (The round-3 regression saved `time.time()` *after* the work:
+  anything committed while a >5 s tick ran was never rediscovered — silently
+  stale sessions and rollup buckets.)
+- The discovery window is **clamped to `ANALYTICS_MAX_EVENTS_AGE_S`**: a
+  persisted anchor can be arbitrarily old (long outage), and without the
+  clamp the first catch-up tick would try to process the whole backlog in
+  one transaction, hit the statement timeout, roll back, and retry the same
+  unbounded window forever. The abandoned span is counted in
+  `analytics_worker_backlog_abandoned_seconds` (alerted).
+- Anchors still only advance in the same transaction as the work they
+  guard: a failed tick re-processes exactly its (clamped) window, and a
+  restart resumes from the persisted value.
 
 Rollup re-rolls every bucket touched by events *received* since the last tick
 (plus buckets of sessions inserted/deleted this run) — not a fixed trailing
@@ -131,7 +155,7 @@ window, so steady clock skew cannot make a sender invisible. Buckets with ts
 older than `ANALYTICS_MAX_EVENTS_AGE_S` (default 1 h) are dropped and counted
 in `analytics_rollup_dropped_late_total`.
 
-## Input hardening (round-3 review)
+## Input hardening (rounds 3–4 review)
 
 Everything below is enforced in `validate.py` and covered by tests; each item
 used to be a dropped batch (503 = at-most-once loss) or a worker wedge:
@@ -139,16 +163,33 @@ used to be a dropped batch (503 = at-most-once loss) or a worker wedge:
 - **ts** must be finite, > 0, and at most `ANALYTICS_TS_MAX_FUTURE_S` ahead.
   `json.loads` accepts `NaN`/`Infinity` and `nan <= 0` is False — one such
   value used to fail every tick at `int(nan // 60)` / `to_timestamp(1e308)`
-  forever.
+  forever. Round-4: `json.loads` also accepts **400-digit integers**, and
+  `float(10**400)` / `math.isfinite(10**400)` raise OverflowError *inside
+  the validator* — ints are now compared as ints against the 1e12 hard cap
+  (`TS_HARD_MAX`, shared with the rollup's SQL range predicates) before any
+  float conversion.
+- **raw is depth-capped** at 64 levels (round-4): `json.loads` parses
+  arbitrarily deep structures, and the recursive sanitizer / `json.dumps`
+  for the jsonb INSERT die with RecursionError near ~1000 — which escaped as
+  a 503 and dropped the whole batch. Deeper events are quarantined whole as
+  `raw_too_deep` (the quarantine row stores a stub raw — it must stay
+  insertable too).
+- **A crashing validator cannot 503 the batch** (round-4): every
+  `validate_event` call is wrapped; an unexpected exception quarantines the
+  event as `validator_error` and the batch still gets its 202. The contract
+  is "one bad event = one quarantine row", and the bug list is not the only
+  thing enforcing it.
 - **NUL and lone surrogates** are replaced with U+FFFD in every string
   (values, keys, nested `raw`); Postgres rejects them in text and jsonb, and
   `user_agent` is client-controlled. Sanitized fields are counted in
   `analytics_events_sanitized_total{field}` (bounded label set).
 - **NaN/Infinity inside `raw`** become the strings `"NaN"` / `"Infinity"`
   (jsonb rejects those tokens).
-- **event_type** is capped at 64 chars (it is a Prometheus label; longer is
-  quarantined as `event_type_too_long`, because truncating would invent
-  types).
+- **event_type** is capped at 64 chars and **allowlist-bounded as a metric
+  label** (round-4): the length cap alone did not bound cardinality. Values
+  outside `ANALYTICS_KNOWN_EVENT_TYPES` are counted under the single label
+  `other` in `analytics_events_unknown_type_total`; which types actually
+  arrived stays queryable in `events.raw` (14-day retention).
 - **Requests are capped** at `ANALYTICS_MAX_EVENTS_PER_BATCH` events (413
   otherwise; 1 MB of `{}` would otherwise become ~350k quarantine rows).
   Caddy enforces `request_body max_size 1MiB` so chunked requests (no
@@ -157,8 +198,12 @@ used to be a dropped batch (503 = at-most-once loss) or a worker wedge:
   contained by a per-event savepoint fallback: the bulk insert is retried
   row-by-row and only the offending event is quarantined
   (`insert_failed`, counted in `analytics_ingest_batch_fallback_total`).
-  The quarantine rows are sanitized with the same rules — a NaN ts must not
-  poison the quarantine INSERT either.
+  Round-4 blocker 5: the fallback catches only data-level errors
+  (DataError/IntegrityError) — a statement timeout or connection error
+  propagates as 503 instead of "quarantining" rows that never got a fair
+  insert attempt. The quarantine rows are sanitized with the same rules — a
+  NaN ts must not poison the quarantine INSERT either (a raw too deep to
+  sanitize is stored as a stub).
 - **Pre-existing poison rows** are scrubbed by migration 002
   (`DELETE ... WHERE NOT (ts >= 0 AND ts < 1e12)` — NaN sorts greatest in
   Postgres, so the predicate catches NaN/±Inf/1e308 and spares real epochs).
@@ -197,6 +242,8 @@ used to be a dropped batch (503 = at-most-once loss) or a worker wedge:
 | `ANALYTICS_WORKER_TICK_S` | 60 | tick cadence |
 | `ANALYTICS_MAX_EVENTS_PER_BATCH` | 5000 | requests with more events are rejected whole (413) |
 | `ANALYTICS_TS_MAX_FUTURE_S` | 86400 | ts further ahead is quarantined as poison, not skew |
+| `ANALYTICS_KNOWN_EVENT_TYPES` | `manifest_request` | comma-separated allowlist; other event_type values are metric-counted under the single label `other` (cardinality bound) |
+| `ANALYTICS_SESSIONS_RETENTION_DAYS` | 90 | per-session rows (carry `client_ip`) deleted after this; aggregates (rollup, gap histogram) keep forever |
 | `ANALYTICS_WORKER_STATEMENT_TIMEOUT_MS` | 60000 | worker pool budget (gap-histogram day-scans need more than the ingester's 1.5 s) |
 | `ANALYTICS_DDL_LOCK_TIMEOUT_MS` | 3000 | partition DDL gives up instead of queueing behind ingest |
 
@@ -228,13 +275,18 @@ used to be a dropped batch (503 = at-most-once loss) or a worker wedge:
 
 `events.raw` is a faithful (post-sanitization) copy of the client payload and
 `events.client_ip` is the connection IP; both are personal data under GDPR.
-The current position: purpose = sessionization + aggregate dashboards only
-(no per-user analytics product), retention bounded (14 days events, 7 days
-quarantine, DROP PARTITION), access via authenticated Grafana only. If your
-DPO requires more, the knobs are: shorter `ANALYTICS_RAW_RETENTION_DAYS`, a
+So is `sessions.client_ip` (round-4: it had no retention at all — it is now
+pruned after `ANALYTICS_SESSIONS_RETENTION_DAYS`, default 90 d, in the same
+maintenance sweep as events/quarantine). The current position: purpose =
+sessionization + aggregate dashboards only (no per-user analytics product),
+retention bounded (14 days events, 7 days quarantine, 90 days sessions,
+DROP PARTITION / DELETE in the ddl phase), aggregates (`rollup_1m`,
+`gap_histogram`) hold no personal data and are kept indefinitely, access via
+authenticated Grafana only. If your DPO requires more, the knobs are: shorter
+`ANALYTICS_RAW_RETENTION_DAYS` / `ANALYTICS_SESSIONS_RETENTION_DAYS`, a
 `dims`-only rollup with raw disabled, or hashing `client_ip` with a server
-side salt (sessionization survives — the key just becomes opaque). None of
-these are implemented yet; they are deliberate product decisions.
+side salt (sessionization survives — the key just becomes opaque). The
+latter two are not implemented yet; they are deliberate product decisions.
 
 ## Known limitations (accepted in design)
 
@@ -242,14 +294,18 @@ these are implemented yet; they are deliberate product decisions.
 - Redirect sessions have structurally zero duration (no heartbeat, doc §4);
   dashboards label this instead of blending.
 - Per-IP sessions are approximate under NAT/truncation/hashing (doc §5).
-  Round-3 improvement: events are gap-checked per session key, so two TVs
-  behind one NAT on different channels no longer fragment into one-event
-  sessions. Merging (two viewers, one channel, one IP) remains unavoidable
-  without a device id — a v2 contract change.
-- A single viewer flipping back to a channel within the gap now produces one
+  Events are gap-checked per session key, so two TVs behind one NAT on
+  different channels no longer fragment into one-event sessions. Merging
+  (two viewers, one channel, one IP) remains unavoidable without a device id
+  — a v2 contract change.
+- A single viewer flipping back to a channel within the gap produces one
   spanning session instead of three fragments; duration therefore includes
-  the away-time. The alternative (split on interleave) is what produced the
-  NAT fragmentation above.
+  the away-time. This is a **deliberate, pinned trade** (round-4: documented
+  in `worker/sessionizer.py`'s module header, pinned by
+  `test_zap_aba_is_one_spanning_session_per_key` on one side and
+  `test_two_views_behind_nat_do_not_fragment` on the other). The alternative
+  (split on interleave) is exactly what produced the NAT fragmentation; a
+  device id in the contract is what resolves the trade properly.
 - Segment-level events (doc §9.3): unknown event types land in `events.raw`
   (typed columns NULL) — queryable from day one, no migration when the
   contract lands.

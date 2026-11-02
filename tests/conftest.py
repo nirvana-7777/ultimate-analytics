@@ -41,4 +41,6 @@ def cfg(dsn):
         public_port=8000, internal_port=9000, log_level="warning",
         max_events_per_batch=5000, worker_statement_timeout_ms=60000,
         ddl_lock_timeout_ms=3000,
+        known_event_types=frozenset({"manifest_request"}),
+        sessions_retention_days=90,
     )
