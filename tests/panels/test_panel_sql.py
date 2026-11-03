@@ -2,8 +2,10 @@
 database here, with the Grafana macros substituted. Plus: the committed
 analytics.json must be in sync with tools/panels.py (anti-drift).
 """
+import datetime as dt
 import json
 import pathlib
+import re
 import sys
 import time
 
@@ -17,9 +19,18 @@ for p in (str(REPO), str(REPO / "ingester")):
 from tools.panels import PANELS  # noqa: E402
 
 
+def _ts_literal(epoch: int) -> str:
+    """Timestamp literal as Grafana expands $__timeFrom() / $__timeTo()."""
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("'%Y-%m-%dT%H:%M:%SZ'")
+
+
 def render(sql: str) -> str:
     now = int(time.time())
     frm = now - 3600
+    # $__timeGroupAlias(col, $__interval) -> floor(epoch / step) * step AS "time"
+    # (the panels set a 1m minimum interval, so the step is 60s here)
+    sql = re.sub(r"\$__timeGroupAlias\((\w+),\s*\$__interval\)",
+                 r'floor(extract(epoch FROM \1) / 60) * 60 AS "time"', sql)
     return (
         sql
         .replace("$__timeFilter(bucket)",
@@ -29,6 +40,9 @@ def render(sql: str) -> str:
         .replace("$__unixEpochFilter(ts)",
                  f"ts > {frm} AND ts < {now}")
         .replace("$__unixEpochTo()", str(now))
+        .replace("$__timeFrom()", _ts_literal(frm))
+        .replace("$__timeTo()", _ts_literal(now))
+        .replace("$__interval_ms", "60000")
     )
 
 

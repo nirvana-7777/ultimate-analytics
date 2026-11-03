@@ -366,10 +366,10 @@ def test_sessions_retention_prunes_personal_data(conn, cfg):
         rollup_touched(conn, cfg, [], [], now - 3600)
         assert one(conn, "SELECT count(*) FROM rollup_1m")[0] >= 1
         # age the session beyond retention (cfg.sessions_retention_days=90)
-        from app.partitions import prune
+        from app.partitions import prune_data
         cur.execute("UPDATE sessions SET started_at = %s, ended_at = %s",
                     (now - 91 * 86400, now - 91 * 86400 + 60))
-        prune(cur, cfg)
+        prune_data(cur, cfg)  # row-level retention; prune() only drops event partitions
     assert one(conn, "SELECT count(*) FROM sessions")[0] == 0
     # the aggregate survives the per-session expiry
     assert one(conn, "SELECT count(*) FROM rollup_1m")[0] >= 1
