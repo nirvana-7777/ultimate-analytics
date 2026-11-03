@@ -20,26 +20,8 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: analytics
-          POSTGRES_PASSWORD: analytics
-          POSTGRES_DB: analytics
-          # compose pins timezone=UTC (partition bounds depend on it); keep CI identical.
-          TZ: UTC
-          PGTZ: UTC
-        ports: [ "5432:5432" ]
-        options: >-
-          --health-cmd "pg_isready -U analytics -d analytics"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      # TODO: use the variable name(s) that app.db and tests/panels/test_panel_sql.py read.
-      ANALYTICS_DATABASE_URL: postgresql://analytics:analytics@localhost:5432/analytics
-
+    # No Postgres service container: the integration tests (incl. panel SQL) use
+    # pgserver, an embedded Postgres installed via requirements-dev.txt.
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -49,23 +31,19 @@ jobs:
         with:
           python-version: '3.12'          # matches the python:3.12 base image
           cache: 'pip'
-          cache-dependency-path: '**/requirements*.txt'
+          cache-dependency-path: ingester/requirements*.txt
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio
-
+      # tools/build_dashboard.py is stdlib-only, so this needs no dependencies.
       - name: Dashboard JSON is in sync with tools/panels.py
         run: |
           python tools/build_dashboard.py
           git diff --exit-code -- grafana/provisioning/dashboards/analytics.json
 
-      # Remove this step if the tests create the schema themselves.
-      - name: Migrate database
-        run: python -m app.db migrate
+      # requirements-dev.txt pulls in requirements.txt (-r) plus pytest, httpx, pgserver.
+      - name: Install dependencies
+        run: pip install -r ingester/requirements-dev.txt
 
-      - name: Run tests (incl. panel SQL against real Postgres)
+      - name: Run tests (incl. panel SQL against embedded Postgres)
         run: pytest -q
 
   config:
@@ -89,7 +67,7 @@ jobs:
           for s in pg_password grafana_admin grafana_pg_password; do
             [ -e "secrets/$s" ] || echo ci > "secrets/$s"
           done
-          touch .env
+          [ -e .env ] || cp env.example .env
           docker compose config --quiet
 
   caddy:
