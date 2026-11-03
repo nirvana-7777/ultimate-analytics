@@ -1,0 +1,8 @@
+.env
+secrets/pg_password
+secrets/grafana_admin
+__pycache__/
+*.pyc
+.pytest_cache/
+.pgtest/
+*.tar.gz
